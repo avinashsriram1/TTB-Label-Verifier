@@ -31,7 +31,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -161,9 +162,20 @@ input {
 }
 
 input:focus,
+select:focus,
 button:focus-visible {
   outline: 3px solid rgb(47 128 237 / 32%);
   outline-offset: 2px;
+}
+
+select {
+  min-height: 44px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+  color: var(--text);
+  font-weight: 700;
 }
 
 .auto-check {
@@ -359,6 +371,22 @@ th {
   margin: 14px 0;
 }
 
+.review-tools {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 16px 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f8fbfd;
+}
+
+.review-tools label {
+  min-width: 180px;
+}
+
 details {
   margin-top: 12px;
 }
@@ -386,6 +414,53 @@ summary {
 
 .debug-grid strong {
   color: var(--text);
+}
+
+.pass-table {
+  margin-top: 8px;
+  font-size: 13px;
+}
+
+.redacted {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid #bad6e0;
+  border-radius: 8px;
+  background: #eef8fb;
+  color: #164c5b;
+  font-weight: 700;
+}
+
+.correction-form {
+  display: grid;
+  grid-template-columns: auto minmax(170px, 220px) minmax(220px, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid #c8e0ca;
+  border-radius: 8px;
+  background: #f2fff6;
+}
+
+.correction-form strong {
+  color: var(--pass);
+}
+
+.correction-form input,
+.correction-form select {
+  min-height: 42px;
+}
+
+.correction-form button {
+  border: 0;
+  border-radius: 8px;
+  background: var(--pass);
+  color: #ffffff;
+  min-height: 42px;
+  padding: 10px 14px;
+  font-weight: 800;
+  cursor: pointer;
 }
 
 pre {
@@ -433,5 +508,11 @@ pre {
 
   td {
     padding: 8px 0;
+  }
+
+  .review-tools,
+  .correction-form {
+    display: grid;
+    grid-template-columns: 1fr;
   }
 }

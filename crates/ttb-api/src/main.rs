@@ -5,11 +5,13 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{RwLock, Semaphore};
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
@@ -28,6 +30,25 @@ const BATCH_PARALLELISM: usize = 4;
 struct AppState {
     ocr: Arc<dyn OcrEngine>,
     jobs: Arc<RwLock<HashMap<Uuid, BatchJob>>>,
+    corrections: Arc<RwLock<Vec<CorrectionRecord>>>,
+    config: AppConfig,
+}
+
+#[derive(Debug, Clone)]
+struct AppConfig {
+    show_raw_ocr: bool,
+    correction_store_path: Option<PathBuf>,
+}
+
+impl AppConfig {
+    fn from_env() -> Self {
+        Self {
+            show_raw_ocr: env_flag("TTB_SHOW_RAW_OCR", false),
+            correction_store_path: std::env::var("TTB_CORRECTIONS_PATH")
+                .ok()
+                .map(PathBuf::from),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -55,6 +76,30 @@ struct BatchJob {
     counts: BatchCounts,
     results: Vec<VerificationResult>,
     errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CorrectionInput {
+    product_id: String,
+    label: Option<String>,
+    field: String,
+    expected: Option<String>,
+    corrected_value: String,
+    verifier_note: Option<String>,
+    verdict: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CorrectionRecord {
+    correction_id: Uuid,
+    product_id: String,
+    label: Option<String>,
+    field: String,
+    expected: Option<String>,
+    corrected_value: String,
+    verifier_note: Option<String>,
+    verdict: Option<String>,
+    created_unix_ms: u128,
 }
 
 #[derive(Debug)]
@@ -92,9 +137,12 @@ async fn main() -> Result<()> {
         .init();
 
     let ocr: Arc<dyn OcrEngine> = Arc::new(TesseractCliEngine::new());
+    let config = AppConfig::from_env();
     let state = Arc::new(AppState {
         ocr,
         jobs: Arc::new(RwLock::new(HashMap::new())),
+        corrections: Arc::new(RwLock::new(Vec::new())),
+        config,
     });
 
     let app = build_router(state);
@@ -123,6 +171,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/batch/jobs", post(create_batch_job))
         .route("/api/batch/jobs/{job_id}", get(get_batch_job))
         .route("/api/batch/jobs/{job_id}/export.csv", get(export_batch_job))
+        .route("/api/corrections", post(create_correction))
+        .route("/api/corrections/export.csv", get(export_corrections))
         .fallback_service(ServeDir::new(ui_dir).fallback(fallback))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
@@ -136,6 +186,23 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "ocr": {
             "engine": state.ocr.name(),
             "available": state.ocr.is_available()
+        },
+        "security": {
+            "raw_ocr_visible": state.config.show_raw_ocr
+        },
+        "corrections": {
+            "enabled": true,
+            "durable": state.config.correction_store_path.is_some()
+        },
+        "v2": {
+            "ocr_pass_reports": true,
+            "span_labeling": "heuristic_baseline",
+            "candidate_engines": [
+                "tesseract-tsv-local",
+                "rapidocr-onnx-candidate",
+                "paddleocr-onnx-candidate",
+                "litert-js-candidate"
+            ]
         }
     }))
 }
@@ -179,6 +246,18 @@ async fn openapi() -> Json<serde_json::Value> {
                     "summary": "Health and OCR engine availability",
                     "responses": {"200": {"description": "Health"}}
                 }
+            },
+            "/api/corrections": {
+                "post": {
+                    "summary": "Store a structured human correction without raw images or raw OCR",
+                    "responses": {"200": {"description": "CorrectionRecord"}}
+                }
+            },
+            "/api/corrections/export.csv": {
+                "get": {
+                    "summary": "Export structured human corrections as CSV",
+                    "responses": {"200": {"description": "CSV export"}}
+                }
             }
         }
     }))
@@ -212,7 +291,10 @@ async fn verify(
         expected,
         images: form.images,
     };
-    let result = verify_product(state.ocr.as_ref(), product).await;
+    let result = sanitize_result_for_response(
+        verify_product(state.ocr.as_ref(), product).await,
+        &state.config,
+    );
     Ok(Json(result))
 }
 
@@ -325,6 +407,88 @@ async fn export_batch_job(
     Ok((headers, Body::from(body)).into_response())
 }
 
+async fn create_correction(
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<CorrectionInput>,
+) -> Result<Json<CorrectionRecord>, AppError> {
+    let product_id = input.product_id.trim();
+    let field = input.field.trim();
+    let corrected_value = input.corrected_value.trim();
+
+    if product_id.is_empty() {
+        return Err(AppError(anyhow::anyhow!("product_id is required")));
+    }
+    if field.is_empty() {
+        return Err(AppError(anyhow::anyhow!("field is required")));
+    }
+    if corrected_value.is_empty() {
+        return Err(AppError(anyhow::anyhow!("corrected_value is required")));
+    }
+
+    let record = CorrectionRecord {
+        correction_id: Uuid::new_v4(),
+        product_id: product_id.to_string(),
+        label: input.label.filter(|value| !value.trim().is_empty()),
+        field: field.to_string(),
+        expected: input.expected.filter(|value| !value.trim().is_empty()),
+        corrected_value: corrected_value.to_string(),
+        verifier_note: input.verifier_note.filter(|value| !value.trim().is_empty()),
+        verdict: input.verdict.filter(|value| !value.trim().is_empty()),
+        created_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default(),
+    };
+
+    if let Some(path) = &state.config.correction_store_path {
+        append_correction_record(path, &record).await?;
+    }
+
+    state.corrections.write().await.push(record.clone());
+    Ok(Json(record))
+}
+
+async fn export_corrections(State(state): State<Arc<AppState>>) -> Result<Response, AppError> {
+    let corrections = state.corrections.read().await;
+    let mut writer = csv::Writer::from_writer(Vec::new());
+    writer.write_record([
+        "correction_id",
+        "product_id",
+        "label",
+        "field",
+        "expected",
+        "corrected_value",
+        "verifier_note",
+        "verdict",
+        "created_unix_ms",
+    ])?;
+
+    for record in corrections.iter() {
+        writer.write_record([
+            record.correction_id.to_string(),
+            record.product_id.clone(),
+            record.label.clone().unwrap_or_default(),
+            record.field.clone(),
+            record.expected.clone().unwrap_or_default(),
+            record.corrected_value.clone(),
+            record.verifier_note.clone().unwrap_or_default(),
+            record.verdict.clone().unwrap_or_default(),
+            record.created_unix_ms.to_string(),
+        ])?;
+    }
+
+    let body = writer
+        .into_inner()
+        .context("finalize corrections CSV export")?;
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/csv"));
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=\"ttb-corrections.csv\""),
+    );
+    Ok((headers, Body::from(body)).into_response())
+}
+
 async fn process_batch_job(state: Arc<AppState>, job_id: Uuid, products: Vec<ProductInput>) {
     {
         let mut jobs = state.jobs.write().await;
@@ -348,6 +512,7 @@ async fn process_batch_job(state: Arc<AppState>, job_id: Uuid, products: Vec<Pro
     for handle in handles {
         match handle.await {
             Ok(result) => {
+                let result = sanitize_result_for_response(result, &state.config);
                 let mut jobs = state.jobs.write().await;
                 if let Some(job) = jobs.get_mut(&job_id) {
                     job.completed += 1;
@@ -376,6 +541,159 @@ async fn process_batch_job(state: Arc<AppState>, job_id: Uuid, products: Vec<Pro
         } else {
             JobStatus::Failed
         };
+    }
+}
+
+async fn append_correction_record(path: &PathBuf, record: &CorrectionRecord) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("create correction store directory {}", parent.display()))?;
+    }
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+        .with_context(|| format!("open correction store {}", path.display()))?;
+    let line = serde_json::to_string(record).context("serialize correction record")?;
+    file.write_all(line.as_bytes()).await?;
+    file.write_all(b"\n").await?;
+    Ok(())
+}
+
+fn sanitize_result_for_response(
+    mut result: VerificationResult,
+    config: &AppConfig,
+) -> VerificationResult {
+    if config.show_raw_ocr {
+        return result;
+    }
+
+    result.raw_text.clear();
+    for span in &mut result.spans {
+        span.text.clear();
+    }
+    for field in result.fields.values_mut() {
+        for span in &mut field.evidence {
+            span.text.clear();
+        }
+    }
+    for span in &mut result.government_warning.evidence {
+        span.text.clear();
+    }
+    result.government_warning.found_text = None;
+    result
+        .notes
+        .push("Raw OCR text is hidden by deployment configuration.".to_string());
+    result
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ttb_core::{BoundingBox, CheckStatus, FieldCheck, TextSpan, Verdict, WarningCheck};
+
+    fn raw_span() -> TextSpan {
+        TextSpan {
+            image_id: "img".to_string(),
+            source_engine: "test".to_string(),
+            text: "RAW OCR TEXT".to_string(),
+            confidence: Some(95.0),
+            bbox: Some(BoundingBox {
+                x: 1,
+                y: 2,
+                width: 3,
+                height: 4,
+            }),
+        }
+    }
+
+    fn result_with_raw_ocr() -> VerificationResult {
+        let span = raw_span();
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "brand_name".to_string(),
+            FieldCheck {
+                field: "brand_name".to_string(),
+                expected: Some("Brand".to_string()),
+                observed: Some("Brand".to_string()),
+                status: CheckStatus::Pass,
+                confidence: 0.99,
+                detail: "Brand appears.".to_string(),
+                evidence: vec![span.clone()],
+            },
+        );
+
+        VerificationResult {
+            product_id: "product".to_string(),
+            label: None,
+            verdict: Verdict::Pass,
+            fields,
+            government_warning: WarningCheck {
+                present: true,
+                status: CheckStatus::Pass,
+                found_text: Some("GOVERNMENT WARNING raw body".to_string()),
+                heading_all_caps: Some(true),
+                bold_confirmed: None,
+                wording_similarity: 1.0,
+                detail: "Warning found.".to_string(),
+                issues: Vec::new(),
+                evidence: vec![span.clone()],
+            },
+            raw_text: "FULL RAW OCR".to_string(),
+            spans: vec![span],
+            span_labels: Vec::new(),
+            ocr_passes: Vec::new(),
+            engines: vec!["test".to_string()],
+            image_count: 1,
+            latency_ms: 1,
+            notes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn response_sanitizer_hides_raw_ocr_by_default() {
+        let config = AppConfig {
+            show_raw_ocr: false,
+            correction_store_path: None,
+        };
+        let result = sanitize_result_for_response(result_with_raw_ocr(), &config);
+
+        assert!(result.raw_text.is_empty());
+        assert_eq!(result.spans[0].text, "");
+        assert_eq!(result.fields["brand_name"].evidence[0].text, "");
+        assert_eq!(result.government_warning.evidence[0].text, "");
+        assert!(result.government_warning.found_text.is_none());
+    }
+
+    #[test]
+    fn response_sanitizer_can_keep_raw_ocr_for_local_debug() {
+        let config = AppConfig {
+            show_raw_ocr: true,
+            correction_store_path: None,
+        };
+        let result = sanitize_result_for_response(result_with_raw_ocr(), &config);
+
+        assert_eq!(result.raw_text, "FULL RAW OCR");
+        assert_eq!(result.spans[0].text, "RAW OCR TEXT");
+        assert_eq!(
+            result.government_warning.found_text.as_deref(),
+            Some("GOVERNMENT WARNING raw body")
+        );
     }
 }
 

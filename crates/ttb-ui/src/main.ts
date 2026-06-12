@@ -20,6 +20,24 @@ type WarningCheck = {
   issues: string[];
 };
 
+type OcrPassReport = {
+  image_id: string;
+  profile: string;
+  rotation_degrees: number;
+  elapsed_ms: number;
+  span_count: number;
+  mean_confidence?: number | null;
+  warning_heading_detected: boolean;
+  error?: string | null;
+};
+
+type SpanLabel = {
+  image_id: string;
+  label: string;
+  confidence: number;
+  reason: string;
+};
+
 type VerificationResult = {
   product_id: string;
   label?: string | null;
@@ -27,6 +45,8 @@ type VerificationResult = {
   fields: Record<string, FieldCheck>;
   government_warning: WarningCheck;
   raw_text: string;
+  span_labels: SpanLabel[];
+  ocr_passes: OcrPassReport[];
   engines: string[];
   image_count: number;
   latency_ms: number;
@@ -43,6 +63,11 @@ type BatchJob = {
   errors: string[];
 };
 
+type HealthResponse = {
+  security?: { raw_ocr_visible?: boolean };
+  corrections?: { enabled?: boolean; durable?: boolean };
+};
+
 const appElement = document.querySelector<HTMLDivElement>("#app");
 if (!appElement) throw new Error("missing app root");
 const app = appElement;
@@ -51,6 +76,14 @@ let activeTab: "single" | "batch" | "review" = "single";
 let singleResult: VerificationResult | null = null;
 let currentJob: BatchJob | null = null;
 let reviewQueue: VerificationResult[] = [];
+let reviewStatusFilter: "all" | "review" | "fail" = "all";
+let reviewReasonFilter: "all" | "warning" | "class_type" | "country" | "low_confidence" = "all";
+let correctionMessage = "";
+let serverConfig = {
+  rawOcrVisible: false,
+  correctionsEnabled: true,
+  correctionsDurable: false,
+};
 let pollTimer: number | undefined;
 
 function render() {
@@ -58,7 +91,7 @@ function render() {
     <header class="topbar">
       <div>
         <h1>TTB Label Verifier</h1>
-        <p>Offline label checks for application data, batch queues, and agent review.</p>
+        <p>Offline label checks with V2 OCR telemetry, structured corrections, and raw OCR hidden by default.</p>
       </div>
       <nav class="tabs" aria-label="Views">
         ${tabButton("single", "Single")}
@@ -76,6 +109,7 @@ function render() {
   bindTabs();
   if (activeTab === "single") bindSingle();
   if (activeTab === "batch") bindBatch();
+  if (activeTab === "review") bindReview();
 }
 
 function tabButton(tab: typeof activeTab, label: string) {
@@ -160,17 +194,40 @@ function renderBatch() {
 }
 
 function renderReview() {
+  const filtered = filteredReviewQueue();
   return `
     <section class="panel">
       <div class="panel-title">
         <h2>Review Queue</h2>
-        <span class="chip">${reviewQueue.length} items</span>
+        <span class="chip">${filtered.length}/${reviewQueue.length} items</span>
       </div>
       <div class="auto-check">
         <strong>Temporary review list.</strong>
         <span>Review and fail results stay here only until this browser tab is refreshed or closed.</span>
       </div>
-      ${reviewQueue.length ? reviewQueue.map(renderResult).join("") : `<div class="empty">No review or fail results.</div>`}
+      <div class="review-tools">
+        <label>
+          <span>Status</span>
+          <select id="review-status-filter">
+            ${option("all", "All", reviewStatusFilter)}
+            ${option("review", "Review", reviewStatusFilter)}
+            ${option("fail", "Fail", reviewStatusFilter)}
+          </select>
+        </label>
+        <label>
+          <span>Reason</span>
+          <select id="review-reason-filter">
+            ${option("all", "All reasons", reviewReasonFilter)}
+            ${option("warning", "Government warning", reviewReasonFilter)}
+            ${option("class_type", "Class/type", reviewReasonFilter)}
+            ${option("country", "Country", reviewReasonFilter)}
+            ${option("low_confidence", "Low confidence", reviewReasonFilter)}
+          </select>
+        </label>
+        <a class="export" href="/api/corrections/export.csv">Export Corrections</a>
+      </div>
+      ${correctionMessage ? `<p class="note">${escapeHtml(correctionMessage)}</p>` : ""}
+      ${filtered.length ? filtered.map(renderResult).join("") : `<div class="empty">No review or fail results match the current filters.</div>`}
     </section>
   `;
 }
@@ -186,6 +243,10 @@ function field(name: string, label: string, placeholder: string, helpText: strin
 
 function help(text: string) {
   return `<button class="help" type="button" title="${escapeHtml(text)}" aria-label="${escapeHtml(text)}">?</button>`;
+}
+
+function option(value: string, label: string, selectedValue: string) {
+  return `<option value="${value}" ${selectedValue === value ? "selected" : ""}>${label}</option>`;
 }
 
 function renderBatchJob(job: BatchJob) {
@@ -246,11 +307,72 @@ function renderResult(result: VerificationResult) {
           <span>Processing time</span><strong>${formatDuration(result.latency_ms)}</strong>
           <span>OCR engine</span><strong>${escapeHtml(result.engines?.join(", ") || "unknown")}</strong>
           <span>Images processed</span><strong>${result.image_count}</strong>
+          <span>OCR passes</span><strong>${result.ocr_passes?.length ?? 0}</strong>
+          <span>Span labels</span><strong>${summarizeSpanLabels(result.span_labels ?? [])}</strong>
         </div>
-        <pre>${escapeHtml(result.raw_text || "No OCR text returned.")}</pre>
+        ${renderOcrPasses(result.ocr_passes ?? [])}
+        ${
+          serverConfig.rawOcrVisible
+            ? `<pre>${escapeHtml(result.raw_text || "No OCR text returned.")}</pre>`
+            : `<p class="redacted">Raw OCR text is hidden by deployment configuration. Set TTB_SHOW_RAW_OCR=true only for local debugging.</p>`
+        }
       </details>
+      ${activeTab === "review" && serverConfig.correctionsEnabled ? renderCorrectionForm(result) : ""}
       ${result.notes.map((note) => `<p class="note">${escapeHtml(note)}</p>`).join("")}
     </article>
+  `;
+}
+
+function renderOcrPasses(passes: OcrPassReport[]) {
+  if (!passes.length) return `<p class="empty">No OCR pass telemetry returned.</p>`;
+  return `
+    <table class="pass-table">
+      <thead><tr><th>Profile</th><th>Rotation</th><th>Time</th><th>Confidence</th><th>Warning</th></tr></thead>
+      <tbody>
+        ${passes
+          .map(
+            (pass) => `
+              <tr>
+                <td>${escapeHtml(pass.profile)}</td>
+                <td>${pass.rotation_degrees}°</td>
+                <td>${formatDuration(pass.elapsed_ms)}</td>
+                <td>${pass.mean_confidence == null ? "" : `${pass.mean_confidence.toFixed(1)}%`}</td>
+                <td>${pass.warning_heading_detected ? "Found" : pass.error ? "Error" : "Not found"}</td>
+              </tr>
+            `,
+          )
+          .join("")}
+      </tbody>
+    </table>
+  `;
+}
+
+function summarizeSpanLabels(labels: SpanLabel[]) {
+  if (!labels.length) return "none";
+  const counts = labels.reduce<Record<string, number>>((acc, label) => {
+    acc[label.label] = (acc[label.label] ?? 0) + 1;
+    return acc;
+  }, {});
+  return Object.entries(counts)
+    .map(([label, count]) => `${label}: ${count}`)
+    .join(", ");
+}
+
+function renderCorrectionForm(result: VerificationResult) {
+  const fieldOptions = [
+    ...Object.keys(result.fields).map((field) => ({ value: field, label: labelFor(field) })),
+    { value: "government_warning", label: "Government Warning" },
+  ];
+
+  return `
+    <form class="correction-form" data-product-id="${escapeHtml(result.product_id)}">
+      <strong>Structured correction</strong>
+      <select name="field">
+        ${fieldOptions.map((item) => `<option value="${item.value}">${item.label}</option>`).join("")}
+      </select>
+      <input name="corrected_value" placeholder="Correct value or concise review note" required />
+      <button type="submit">Save Correction</button>
+    </form>
   `;
 }
 
@@ -296,6 +418,40 @@ function bindBatch() {
   });
 }
 
+function bindReview() {
+  document.querySelector<HTMLSelectElement>("#review-status-filter")?.addEventListener("change", (event) => {
+    reviewStatusFilter = (event.currentTarget as HTMLSelectElement).value as typeof reviewStatusFilter;
+    render();
+  });
+  document.querySelector<HTMLSelectElement>("#review-reason-filter")?.addEventListener("change", (event) => {
+    reviewReasonFilter = (event.currentTarget as HTMLSelectElement).value as typeof reviewReasonFilter;
+    render();
+  });
+  document.querySelectorAll<HTMLFormElement>(".correction-form").forEach((form) => {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget as HTMLFormElement;
+      const productId = form.dataset.productId || "";
+      const result = reviewQueue.find((item) => item.product_id === productId);
+      const data = new FormData(form);
+      const field = String(data.get("field") || "");
+      const correctedValue = String(data.get("corrected_value") || "").trim();
+      if (!result || !field || !correctedValue) return;
+
+      await postJsonBody("/api/corrections", {
+        product_id: result.product_id,
+        label: result.label,
+        field,
+        expected: field === "government_warning" ? null : result.fields[field]?.expected ?? null,
+        corrected_value: correctedValue,
+        verdict: result.verdict,
+      });
+      correctionMessage = `Correction saved for ${result.label || result.product_id}.`;
+      render();
+    });
+  });
+}
+
 function normalizeImageField(data: FormData) {
   const files = data.getAll("images");
   data.delete("images");
@@ -330,8 +486,32 @@ function mergeReviewResults(results: VerificationResult[]) {
   }
 }
 
+function filteredReviewQueue() {
+  return reviewQueue.filter((result) => {
+    if (reviewStatusFilter !== "all" && result.verdict !== reviewStatusFilter) return false;
+    if (reviewReasonFilter === "all") return true;
+    if (reviewReasonFilter === "warning") return result.government_warning.status !== "pass";
+    if (reviewReasonFilter === "class_type") return result.fields.class_type?.status !== "pass";
+    if (reviewReasonFilter === "country") return result.fields.country?.status !== "pass";
+    if (reviewReasonFilter === "low_confidence") {
+      return Object.values(result.fields).some((field) => field.confidence < 0.7);
+    }
+    return true;
+  });
+}
+
 async function postJson<T>(url: string, body: FormData): Promise<T> {
   const response = await fetch(url, { method: "POST", body });
+  if (!response.ok) throw new Error(await response.text());
+  return response.json() as Promise<T>;
+}
+
+async function postJsonBody<T>(url: string, body: unknown): Promise<T> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
   if (!response.ok) throw new Error(await response.text());
   return response.json() as Promise<T>;
 }
@@ -355,4 +535,17 @@ function escapeHtml(value: string) {
   });
 }
 
+async function loadServerConfig() {
+  const health = await getJson<HealthResponse>("/api/health");
+  serverConfig = {
+    rawOcrVisible: Boolean(health.security?.raw_ocr_visible),
+    correctionsEnabled: health.corrections?.enabled !== false,
+    correctionsDurable: Boolean(health.corrections?.durable),
+  };
+  render();
+}
+
 render();
+void loadServerConfig().catch(() => {
+  render();
+});

@@ -4,8 +4,8 @@ use crate::matching::{
     parse_net_contents_ml, similarity, token_overlap,
 };
 use crate::models::{
-    CheckStatus, ExpectedFields, FieldCheck, OcrOutput, ProductInput, TextSpan, Verdict,
-    VerificationResult,
+    CheckStatus, ExpectedFields, FieldCheck, OcrOutput, OcrPassReport, ProductInput, SpanLabel,
+    SpanLabelKind, TextSpan, Verdict, VerificationResult,
 };
 use crate::ocr::OcrEngine;
 use crate::warning::check_government_warning;
@@ -33,6 +33,16 @@ pub async fn verify_product(engine: &dyn OcrEngine, product: ProductInput) -> Ve
                     engine: engine.name().to_string(),
                     raw_text: String::new(),
                     spans: Vec::new(),
+                    passes: vec![OcrPassReport {
+                        image_id: image.image_id.clone(),
+                        profile: "failed".to_string(),
+                        rotation_degrees: 0,
+                        elapsed_ms: 0,
+                        span_count: 0,
+                        mean_confidence: None,
+                        warning_heading_detected: false,
+                        error: Some(err.to_string()),
+                    }],
                     warnings: vec![err.to_string()],
                     elapsed_ms: 0,
                 });
@@ -49,6 +59,10 @@ pub async fn verify_product(engine: &dyn OcrEngine, product: ProductInput) -> Ve
         .iter()
         .flat_map(|output| output.spans.clone())
         .collect::<Vec<_>>();
+    let ocr_passes = outputs
+        .iter()
+        .flat_map(|output| output.passes.clone())
+        .collect::<Vec<_>>();
     let engines = outputs
         .iter()
         .map(|output| output.engine.clone())
@@ -58,6 +72,7 @@ pub async fn verify_product(engine: &dyn OcrEngine, product: ProductInput) -> Ve
 
     let fields = verify_fields(&product.expected, &raw_text, &spans);
     let government_warning = check_government_warning(&raw_text, &spans);
+    let span_labels = label_spans(&product.expected, &spans);
     let verdict = aggregate_verdict(&fields, &government_warning.status);
 
     VerificationResult {
@@ -68,6 +83,8 @@ pub async fn verify_product(engine: &dyn OcrEngine, product: ProductInput) -> Ve
         government_warning,
         raw_text,
         spans,
+        span_labels,
+        ocr_passes,
         engines,
         image_count: product.images.len(),
         latency_ms: started.elapsed().as_millis(),
@@ -924,6 +941,101 @@ fn numeric_evidence(spans: &[TextSpan], needles: &[&str]) -> Vec<TextSpan> {
         .collect()
 }
 
+fn label_spans(expected: &ExpectedFields, spans: &[TextSpan]) -> Vec<SpanLabel> {
+    spans
+        .iter()
+        .map(|span| {
+            let norm = normalize_text(&span.text);
+            let (label, confidence, reason) = classify_span(expected, span, &norm).unwrap_or((
+                SpanLabelKind::Other,
+                span.confidence.unwrap_or(35.0) / 100.0,
+                "No V2 span-labeling rule matched.".to_string(),
+            ));
+
+            SpanLabel {
+                image_id: span.image_id.clone(),
+                bbox: span.bbox.clone(),
+                label,
+                confidence: confidence.clamp(0.0, 1.0),
+                reason,
+            }
+        })
+        .collect()
+}
+
+fn classify_span(
+    expected: &ExpectedFields,
+    span: &TextSpan,
+    norm: &str,
+) -> Option<(SpanLabelKind, f32, String)> {
+    let text = span.text.as_str();
+    let base_confidence = span.confidence.unwrap_or(65.0) / 100.0;
+
+    if norm.contains("government") || norm.contains("warning") {
+        return Some((
+            SpanLabelKind::GovernmentWarning,
+            base_confidence.max(0.9),
+            "Matched government-warning heading token.".to_string(),
+        ));
+    }
+
+    if !extract_abv_candidates(text).is_empty() || !extract_proof_candidates(text).is_empty() {
+        return Some((
+            SpanLabelKind::AlcoholContent,
+            base_confidence.max(0.88),
+            "Matched ABV/proof pattern.".to_string(),
+        ));
+    }
+
+    if !extract_net_contents_candidates(text).is_empty() {
+        return Some((
+            SpanLabelKind::NetContents,
+            base_confidence.max(0.86),
+            "Matched net-contents pattern.".to_string(),
+        ));
+    }
+
+    if detect_observed_class(text).is_some() {
+        return Some((
+            SpanLabelKind::ClassType,
+            base_confidence.max(0.82),
+            "Matched curated alcohol class taxonomy.".to_string(),
+        ));
+    }
+
+    if detect_country(text).is_some() {
+        return Some((
+            SpanLabelKind::Country,
+            base_confidence.max(0.82),
+            "Matched country alias or US city/state inference.".to_string(),
+        ));
+    }
+
+    if expected
+        .brand_name
+        .as_deref()
+        .is_some_and(|brand| similarity(brand, text) >= 0.72 || token_overlap(brand, text) >= 0.72)
+    {
+        return Some((
+            SpanLabelKind::BrandName,
+            base_confidence.max(0.78),
+            "Matched expected brand with fuzzy text features.".to_string(),
+        ));
+    }
+
+    if expected.bottler.as_deref().is_some_and(|bottler| {
+        similarity(bottler, text) >= 0.72 || token_overlap(bottler, text) >= 0.72
+    }) {
+        return Some((
+            SpanLabelKind::Bottler,
+            base_confidence.max(0.76),
+            "Matched expected bottler with fuzzy text features.".to_string(),
+        ));
+    }
+
+    None
+}
+
 fn aggregate_verdict(
     fields: &BTreeMap<String, FieldCheck>,
     warning_status: &CheckStatus,
@@ -1157,6 +1269,16 @@ mod tests {
                 engine: self.name().to_string(),
                 raw_text,
                 spans: Vec::new(),
+                passes: vec![OcrPassReport {
+                    image_id: image.image_id.clone(),
+                    profile: "mock".to_string(),
+                    rotation_degrees: 0,
+                    elapsed_ms: 1,
+                    span_count: 0,
+                    mean_confidence: None,
+                    warning_heading_detected: true,
+                    error: None,
+                }],
                 warnings: Vec::new(),
                 elapsed_ms: 1,
             })

@@ -1,7 +1,7 @@
-use crate::models::{BoundingBox, ImagePayload, OcrOutput, TextSpan};
+use crate::models::{BoundingBox, ImagePayload, OcrOutput, OcrPassReport, TextSpan};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use image::ImageFormat;
+use image::{DynamicImage, ImageFormat};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
@@ -60,37 +60,59 @@ impl OcrEngine for TesseractCliEngine {
         let mut warnings = Vec::new();
         let mut all_spans = Vec::new();
         let mut raw_parts = Vec::new();
+        let mut passes = Vec::new();
 
-        let primary = run_tesseract_bytes(&image.bytes, &image.image_id, self.name()).await?;
+        let primary =
+            run_tesseract_bytes(&image.bytes, &image.image_id, self.name(), "original", 0).await?;
+        passes.push(primary.report.clone());
         raw_parts.push(primary.raw_text);
         all_spans.extend(primary.spans);
 
-        let merged_primary = raw_parts.join(" ");
-        if !merged_primary.contains("GOVERNMENT WARNING") {
-            for angle in [90, 180, 270] {
-                let rotated = match rotate_image_bytes(&image.bytes, angle)
-                    .context("rotate image for warning OCR retry")
-                {
-                    Ok(rotated) => rotated,
+        if should_retry_ocr(&passes) {
+            for variant in retry_variants(&image.bytes, &image.image_id) {
+                let variant = match variant {
+                    Ok(variant) => variant,
                     Err(err) => {
-                        warnings.push(format!("rotated OCR retry {angle} failed: {err}"));
+                        warnings.push(format!("OCR preprocessing retry failed: {err}"));
                         continue;
                     }
                 };
 
                 match run_tesseract_bytes(
-                    &rotated,
-                    &format!("{}-rot{angle}", image.image_id),
+                    &variant.bytes,
+                    &variant.image_id,
                     self.name(),
+                    variant.profile,
+                    variant.rotation_degrees,
                 )
                 .await
                 {
                     Ok(output) if !output.raw_text.trim().is_empty() => {
+                        passes.push(output.report.clone());
                         raw_parts.push(output.raw_text);
                         all_spans.extend(output.spans);
                     }
-                    Ok(_) => {}
-                    Err(err) => warnings.push(format!("rotated OCR retry {angle} failed: {err}")),
+                    Ok(output) => passes.push(output.report.clone()),
+                    Err(err) => {
+                        warnings.push(format!(
+                            "OCR retry {} {}deg failed: {err}",
+                            variant.profile, variant.rotation_degrees
+                        ));
+                        passes.push(OcrPassReport {
+                            image_id: variant.image_id,
+                            profile: variant.profile.to_string(),
+                            rotation_degrees: variant.rotation_degrees,
+                            elapsed_ms: 0,
+                            span_count: 0,
+                            mean_confidence: None,
+                            warning_heading_detected: false,
+                            error: Some(err.to_string()),
+                        });
+                    }
+                }
+
+                if passes.iter().any(|pass| pass.warning_heading_detected) {
+                    break;
                 }
             }
         }
@@ -101,6 +123,7 @@ impl OcrEngine for TesseractCliEngine {
             engine: self.name().to_string(),
             raw_text: raw_parts.join(" "),
             spans: all_spans,
+            passes,
             warnings,
             elapsed_ms: started.elapsed().as_millis(),
         })
@@ -110,9 +133,24 @@ impl OcrEngine for TesseractCliEngine {
 struct TesseractRun {
     raw_text: String,
     spans: Vec<TextSpan>,
+    report: OcrPassReport,
 }
 
-async fn run_tesseract_bytes(bytes: &[u8], image_id: &str, engine: &str) -> Result<TesseractRun> {
+struct OcrRetryVariant {
+    image_id: String,
+    profile: &'static str,
+    rotation_degrees: u16,
+    bytes: Vec<u8>,
+}
+
+async fn run_tesseract_bytes(
+    bytes: &[u8],
+    image_id: &str,
+    engine: &str,
+    profile: &'static str,
+    rotation_degrees: u16,
+) -> Result<TesseractRun> {
+    let started = Instant::now();
     let mut tmp = NamedTempFile::new().context("create temporary OCR image")?;
     tmp.write_all(bytes).context("write temporary OCR image")?;
     let path = tmp.path().to_path_buf();
@@ -141,17 +179,69 @@ async fn run_tesseract_bytes(bytes: &[u8], image_id: &str, engine: &str) -> Resu
         .map(|span| span.text.as_str())
         .collect::<Vec<_>>()
         .join(" ");
+    let mean_confidence = mean_confidence(&spans);
+    let warning_heading_detected = raw_text.contains("GOVERNMENT WARNING");
+    let span_count = spans.len();
+    let report = OcrPassReport {
+        image_id: image_id.to_string(),
+        profile: profile.to_string(),
+        rotation_degrees,
+        elapsed_ms: started.elapsed().as_millis(),
+        span_count,
+        mean_confidence,
+        warning_heading_detected,
+        error: None,
+    };
 
-    Ok(TesseractRun { spans, raw_text })
+    Ok(TesseractRun {
+        spans,
+        raw_text,
+        report,
+    })
 }
 
-fn rotate_image_bytes(bytes: &[u8], angle: u16) -> Result<Vec<u8>> {
+fn should_retry_ocr(passes: &[OcrPassReport]) -> bool {
+    let Some(primary) = passes.first() else {
+        return false;
+    };
+
+    !primary.warning_heading_detected || primary.mean_confidence.unwrap_or(0.0) < 55.0
+}
+
+fn retry_variants(bytes: &[u8], image_id: &str) -> Vec<Result<OcrRetryVariant>> {
+    [
+        ("contrast", 0),
+        ("threshold", 0),
+        ("original", 90),
+        ("original", 180),
+        ("original", 270),
+    ]
+    .into_iter()
+    .map(|(profile, rotation_degrees)| {
+        prepare_variant(bytes, profile, rotation_degrees).map(|bytes| OcrRetryVariant {
+            image_id: format!("{image_id}-{profile}-rot{rotation_degrees}"),
+            profile,
+            rotation_degrees,
+            bytes,
+        })
+    })
+    .collect()
+}
+
+fn prepare_variant(bytes: &[u8], profile: &'static str, rotation_degrees: u16) -> Result<Vec<u8>> {
     let image = image::load_from_memory(bytes).context("decode image for OCR rotation")?;
-    let rotated = match angle {
-        90 => image.rotate90(),
-        180 => image.rotate180(),
-        270 => image.rotate270(),
-        _ => image,
+    let processed = match profile {
+        "original" => image,
+        "contrast" => image.grayscale().adjust_contrast(35.0),
+        "threshold" => threshold_image(&image),
+        _ => anyhow::bail!("unknown OCR preprocessing profile {profile}"),
+    };
+    let rotated = match rotation_degrees {
+        0 => processed,
+        90 => processed.rotate90(),
+        180 => processed.rotate180(),
+        270 => processed.rotate270(),
+        _ => anyhow::bail!("unsupported OCR rotation {rotation_degrees}"),
     };
 
     let mut cursor = std::io::Cursor::new(Vec::new());
@@ -159,6 +249,26 @@ fn rotate_image_bytes(bytes: &[u8], angle: u16) -> Result<Vec<u8>> {
         .write_to(&mut cursor, ImageFormat::Png)
         .context("encode rotated OCR image")?;
     Ok(cursor.into_inner())
+}
+
+fn threshold_image(image: &DynamicImage) -> DynamicImage {
+    let mut luma = image.grayscale().to_luma8();
+    for pixel in luma.pixels_mut() {
+        pixel.0[0] = if pixel.0[0] >= 170 { 255 } else { 0 };
+    }
+    DynamicImage::ImageLuma8(luma)
+}
+
+fn mean_confidence(spans: &[TextSpan]) -> Option<f32> {
+    let confidences = spans
+        .iter()
+        .filter_map(|span| span.confidence)
+        .collect::<Vec<_>>();
+    if confidences.is_empty() {
+        return None;
+    }
+
+    Some(confidences.iter().sum::<f32>() / confidences.len() as f32)
 }
 
 fn parse_tesseract_tsv(tsv: &str, image_id: &str, engine: &str) -> Vec<TextSpan> {
@@ -225,16 +335,55 @@ mod tests {
     }
 
     #[test]
-    fn rotates_image_bytes_for_warning_retry() {
+    fn prepares_rotated_image_variant_for_warning_retry() {
         let mut bytes = Vec::new();
         let image = image::RgbImage::from_pixel(2, 4, image::Rgb([255, 255, 255]));
         image
             .write_to(&mut std::io::Cursor::new(&mut bytes), ImageFormat::Png)
             .unwrap();
 
-        let rotated = rotate_image_bytes(&bytes, 90).unwrap();
+        let rotated = prepare_variant(&bytes, "original", 90).unwrap();
         let decoded = image::load_from_memory(&rotated).unwrap();
         assert_eq!(decoded.width(), 4);
         assert_eq!(decoded.height(), 2);
+    }
+
+    #[test]
+    fn threshold_variant_keeps_image_decodable() {
+        let mut bytes = Vec::new();
+        let image = image::RgbImage::from_pixel(2, 2, image::Rgb([180, 180, 180]));
+        image
+            .write_to(&mut std::io::Cursor::new(&mut bytes), ImageFormat::Png)
+            .unwrap();
+
+        let processed = prepare_variant(&bytes, "threshold", 0).unwrap();
+        let decoded = image::load_from_memory(&processed).unwrap();
+        assert_eq!(decoded.width(), 2);
+        assert_eq!(decoded.height(), 2);
+    }
+
+    #[test]
+    fn low_confidence_or_missing_warning_triggers_retry() {
+        assert!(should_retry_ocr(&[OcrPassReport {
+            image_id: "img".to_string(),
+            profile: "original".to_string(),
+            rotation_degrees: 0,
+            elapsed_ms: 1,
+            span_count: 1,
+            mean_confidence: Some(90.0),
+            warning_heading_detected: false,
+            error: None,
+        }]));
+
+        assert!(!should_retry_ocr(&[OcrPassReport {
+            image_id: "img".to_string(),
+            profile: "original".to_string(),
+            rotation_degrees: 0,
+            elapsed_ms: 1,
+            span_count: 1,
+            mean_confidence: Some(90.0),
+            warning_heading_detected: true,
+            error: None,
+        }]));
     }
 }

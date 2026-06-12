@@ -202,6 +202,15 @@ known test labels exposed four priorities:
 - Ecstasy: observed values must never expose raw OCR text, even when a fuzzy match
   succeeds.
 
+This branch implements the first V2 increment:
+
+- OCR pass telemetry for preprocessing and rotation retries.
+- Local contrast and threshold preprocessing before selected OCR retries.
+- A heuristic span-labeling baseline for future learned extraction.
+- Review queue filters by verdict and fail/review reason.
+- Structured correction capture with no raw image or raw OCR storage.
+- API-level redaction for raw OCR, span text, and warning found text.
+
 ### Image Robustness
 
 - Add local preprocessing profiles before OCR: contrast normalization, grayscale,
@@ -258,6 +267,13 @@ known test labels exposed four priorities:
 - Add a deployment flag to hide raw OCR debug output entirely in production.
 - Expand batch review filters by fail reason, warning status, class mismatch, country
   mismatch, and low confidence.
+
+Runtime flags:
+
+- `TTB_SHOW_RAW_OCR=true` exposes raw OCR in API/UI debug output for local debugging.
+  The default is `false`.
+- `TTB_CORRECTIONS_PATH=./tmp/corrections.ndjson` appends structured correction
+  records to newline-delimited JSON. If unset, corrections stay in memory only.
 
 ## Assumptions
 
