@@ -1,13 +1,14 @@
 use crate::models::{BoundingBox, ImagePayload, OcrOutput, OcrPassReport, TextSpan};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use image::{DynamicImage, ImageFormat};
+use image::{DynamicImage, GenericImageView, ImageFormat, imageops::FilterType};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 use tokio::process::Command;
+use tokio::time::timeout;
 
 #[async_trait]
 pub trait OcrEngine: Send + Sync {
@@ -57,20 +58,45 @@ impl OcrEngine for TesseractCliEngine {
 
     async fn read(&self, image: &ImagePayload) -> Result<OcrOutput> {
         let started = Instant::now();
+        let budget_ms = image_time_budget_ms();
+        let profile = ProcessingProfile::from_env();
         let mut warnings = Vec::new();
         let mut all_spans = Vec::new();
         let mut raw_parts = Vec::new();
         let mut passes = Vec::new();
 
-        let primary =
-            run_tesseract_bytes(&image.bytes, &image.image_id, self.name(), "original", 0).await?;
+        let primary_bytes = prepare_primary_bytes(&image.bytes)?;
+        let primary = run_tesseract_bytes(
+            &primary_bytes.bytes,
+            &image.image_id,
+            self.name(),
+            primary_bytes.profile,
+            0,
+            remaining_budget_ms(started, budget_ms),
+        )
+        .await?;
         passes.push(primary.report.clone());
         raw_parts.push(primary.raw_text);
         all_spans.extend(primary.spans);
 
-        let retry_mode = OcrRetryMode::from_env();
-        if should_retry_ocr(&passes, retry_mode) {
-            for variant in retry_variants(&image.bytes, &image.image_id, retry_mode) {
+        let primary_text = raw_parts.join(" ");
+        if should_retry_ocr(&passes, profile, &primary_text) {
+            for variant in retry_variants(
+                &primary_bytes.bytes,
+                &image.image_id,
+                profile,
+                passes.first(),
+                &primary_text,
+            ) {
+                let remaining = remaining_budget_ms(started, budget_ms);
+                if remaining <= 250 {
+                    warnings.push(
+                        "OCR retry skipped because the per-image budget was nearly exhausted."
+                            .to_string(),
+                    );
+                    break;
+                }
+
                 let variant = match variant {
                     Ok(variant) => variant,
                     Err(err) => {
@@ -85,6 +111,7 @@ impl OcrEngine for TesseractCliEngine {
                     self.name(),
                     variant.profile,
                     variant.rotation_degrees,
+                    remaining,
                 )
                 .await
                 {
@@ -112,7 +139,9 @@ impl OcrEngine for TesseractCliEngine {
                     }
                 }
 
-                if passes.iter().any(|pass| pass.warning_heading_detected) {
+                if passes.iter().any(|pass| pass.warning_heading_detected)
+                    || started.elapsed().as_millis() >= budget_ms
+                {
                     break;
                 }
             }
@@ -145,25 +174,30 @@ struct OcrRetryVariant {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OcrRetryMode {
+enum ProcessingProfile {
     Fast,
-    Balanced,
+    Adaptive,
     Enhanced,
 }
 
-impl OcrRetryMode {
+impl ProcessingProfile {
     fn from_env() -> Self {
-        match std::env::var("TTB_OCR_RETRY_MODE")
-            .unwrap_or_else(|_| "fast".to_string())
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "balanced" => Self::Balanced,
+        let configured = std::env::var("TTB_PROCESSING_PROFILE")
+            .or_else(|_| std::env::var("TTB_OCR_RETRY_MODE"))
+            .unwrap_or_else(|_| "adaptive".to_string());
+
+        match configured.trim().to_ascii_lowercase().as_str() {
+            "fast" => Self::Fast,
+            "balanced" | "adaptive" => Self::Adaptive,
             "enhanced" => Self::Enhanced,
-            _ => Self::Fast,
+            _ => Self::Adaptive,
         }
     }
+}
+
+struct PrimaryBytes {
+    profile: &'static str,
+    bytes: Vec<u8>,
 }
 
 async fn run_tesseract_bytes(
@@ -172,23 +206,29 @@ async fn run_tesseract_bytes(
     engine: &str,
     profile: &'static str,
     rotation_degrees: u16,
+    timeout_ms: u128,
 ) -> Result<TesseractRun> {
     let started = Instant::now();
     let mut tmp = NamedTempFile::new().context("create temporary OCR image")?;
     tmp.write_all(bytes).context("write temporary OCR image")?;
     let path = tmp.path().to_path_buf();
 
-    let output = Command::new(TesseractCliEngine::command_path())
+    let mut command = Command::new(TesseractCliEngine::command_path());
+    command
+        .kill_on_drop(true)
         .arg(&path)
         .arg("stdout")
         .arg("--psm")
         .arg("6")
-        .arg("tsv")
-        .output()
-        .await
-        .context(
+        .arg("tsv");
+
+    let timeout_ms = timeout_ms.max(250) as u64;
+    let output = match timeout(Duration::from_millis(timeout_ms), command.output()).await {
+        Ok(output) => output.context(
             "run tesseract; set TESSERACT_CMD, add Tesseract to PATH, or use the Docker image",
-        )?;
+        )?,
+        Err(_) => return Err(anyhow!("tesseract timed out after {timeout_ms} ms")),
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -223,20 +263,43 @@ async fn run_tesseract_bytes(
     })
 }
 
-fn should_retry_ocr(passes: &[OcrPassReport], mode: OcrRetryMode) -> bool {
+fn should_retry_ocr(passes: &[OcrPassReport], profile: ProcessingProfile, raw_text: &str) -> bool {
     let Some(primary) = passes.first() else {
         return false;
     };
 
-    !matches!(mode, OcrRetryMode::Fast)
-        && (!primary.warning_heading_detected || primary.mean_confidence.unwrap_or(0.0) < 55.0)
+    if matches!(profile, ProcessingProfile::Fast) {
+        return false;
+    }
+
+    if primary.warning_heading_detected || has_warning_like_text(raw_text) {
+        return false;
+    }
+
+    primary.mean_confidence.unwrap_or(0.0) < 55.0 || primary.span_count < 8
 }
 
-fn retry_profiles(mode: OcrRetryMode) -> &'static [(&'static str, u16)] {
-    match mode {
-        OcrRetryMode::Fast => &[],
-        OcrRetryMode::Balanced => &[("contrast", 0), ("original", 90), ("original", 270)],
-        OcrRetryMode::Enhanced => &[
+fn retry_profiles(
+    profile: ProcessingProfile,
+    primary_report: Option<&OcrPassReport>,
+    raw_text: &str,
+) -> &'static [(&'static str, u16)] {
+    match profile {
+        ProcessingProfile::Fast => &[],
+        ProcessingProfile::Adaptive => {
+            if has_warning_like_text(raw_text) {
+                &[]
+            } else if primary_report
+                .and_then(|report| report.mean_confidence)
+                .unwrap_or(0.0)
+                < 45.0
+            {
+                &[("contrast", 0)]
+            } else {
+                &[("original", 90)]
+            }
+        }
+        ProcessingProfile::Enhanced => &[
             ("contrast", 0),
             ("threshold", 0),
             ("original", 90),
@@ -249,9 +312,11 @@ fn retry_profiles(mode: OcrRetryMode) -> &'static [(&'static str, u16)] {
 fn retry_variants(
     bytes: &[u8],
     image_id: &str,
-    mode: OcrRetryMode,
+    profile: ProcessingProfile,
+    primary_report: Option<&OcrPassReport>,
+    raw_text: &str,
 ) -> Vec<Result<OcrRetryVariant>> {
-    retry_profiles(mode)
+    retry_profiles(profile, primary_report, raw_text)
         .iter()
         .copied()
         .into_iter()
@@ -264,6 +329,34 @@ fn retry_variants(
             })
         })
         .collect()
+}
+
+fn prepare_primary_bytes(bytes: &[u8]) -> Result<PrimaryBytes> {
+    let max_edge = max_image_long_edge();
+    let Ok(image) = image::load_from_memory(bytes) else {
+        return Ok(PrimaryBytes {
+            profile: "original",
+            bytes: bytes.to_vec(),
+        });
+    };
+    let (width, height) = image.dimensions();
+    let long_edge = width.max(height);
+
+    if long_edge <= max_edge {
+        return Ok(PrimaryBytes {
+            profile: "original",
+            bytes: bytes.to_vec(),
+        });
+    }
+
+    let scale = max_edge as f32 / long_edge as f32;
+    let resized_width = ((width as f32 * scale).round() as u32).max(1);
+    let resized_height = ((height as f32 * scale).round() as u32).max(1);
+    let resized = image.resize(resized_width, resized_height, FilterType::Triangle);
+    Ok(PrimaryBytes {
+        profile: "resized",
+        bytes: encode_png(&resized)?,
+    })
 }
 
 fn prepare_variant(bytes: &[u8], profile: &'static str, rotation_degrees: u16) -> Result<Vec<u8>> {
@@ -283,9 +376,15 @@ fn prepare_variant(bytes: &[u8], profile: &'static str, rotation_degrees: u16) -
     };
 
     let mut cursor = std::io::Cursor::new(Vec::new());
-    rotated
+    rotated.write_to(&mut cursor, ImageFormat::Png)?;
+    Ok(cursor.into_inner())
+}
+
+fn encode_png(image: &DynamicImage) -> Result<Vec<u8>> {
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    image
         .write_to(&mut cursor, ImageFormat::Png)
-        .context("encode rotated OCR image")?;
+        .context("encode OCR image")?;
     Ok(cursor.into_inner())
 }
 
@@ -307,6 +406,34 @@ fn mean_confidence(spans: &[TextSpan]) -> Option<f32> {
     }
 
     Some(confidences.iter().sum::<f32>() / confidences.len() as f32)
+}
+
+fn image_time_budget_ms() -> u128 {
+    std::env::var("TTB_IMAGE_TIME_BUDGET_MS")
+        .ok()
+        .and_then(|value| value.parse::<u128>().ok())
+        .filter(|value| *value >= 500)
+        .unwrap_or(4500)
+}
+
+fn remaining_budget_ms(started: Instant, budget_ms: u128) -> u128 {
+    budget_ms.saturating_sub(started.elapsed().as_millis())
+}
+
+fn max_image_long_edge() -> u32 {
+    std::env::var("TTB_MAX_IMAGE_LONG_EDGE")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value >= 600)
+        .unwrap_or(1800)
+}
+
+fn has_warning_like_text(raw_text: &str) -> bool {
+    let upper = raw_text.to_ascii_uppercase();
+    upper.contains("GOVERNMENT")
+        && upper
+            .split_whitespace()
+            .any(|token| token.starts_with("WA"))
 }
 
 fn parse_tesseract_tsv(tsv: &str, image_id: &str, engine: &str) -> Vec<TextSpan> {
@@ -413,15 +540,33 @@ mod tests {
             error: None,
         }];
 
-        assert!(!should_retry_ocr(&missing_warning, OcrRetryMode::Fast));
-        assert!(should_retry_ocr(&missing_warning, OcrRetryMode::Balanced));
-        assert!(should_retry_ocr(&missing_warning, OcrRetryMode::Enhanced));
+        assert!(!should_retry_ocr(
+            &missing_warning,
+            ProcessingProfile::Fast,
+            ""
+        ));
+        assert!(should_retry_ocr(
+            &missing_warning,
+            ProcessingProfile::Adaptive,
+            ""
+        ));
+        assert!(should_retry_ocr(
+            &missing_warning,
+            ProcessingProfile::Enhanced,
+            ""
+        ));
     }
 
     #[test]
     fn retry_mode_controls_number_of_variants() {
-        assert_eq!(retry_profiles(OcrRetryMode::Fast).len(), 0);
-        assert_eq!(retry_profiles(OcrRetryMode::Balanced).len(), 3);
-        assert_eq!(retry_profiles(OcrRetryMode::Enhanced).len(), 5);
+        assert_eq!(retry_profiles(ProcessingProfile::Fast, None, "").len(), 0);
+        assert_eq!(
+            retry_profiles(ProcessingProfile::Adaptive, None, "").len(),
+            1
+        );
+        assert_eq!(
+            retry_profiles(ProcessingProfile::Enhanced, None, "").len(),
+            5
+        );
     }
 }

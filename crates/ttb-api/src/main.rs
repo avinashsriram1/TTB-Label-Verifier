@@ -24,7 +24,6 @@ use ttb_core::{
 use uuid::Uuid;
 
 const MAX_IMAGES_PER_PRODUCT: usize = 4;
-const BATCH_PARALLELISM: usize = 4;
 
 #[derive(Clone)]
 struct AppState {
@@ -197,7 +196,12 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "v2": {
             "ocr_pass_reports": true,
             "span_labeling": "heuristic_baseline",
-            "ocr_retry_mode": ocr_retry_mode(),
+            "processing_profile": processing_profile(),
+            "ocr_retry_mode": processing_profile(),
+            "image_time_budget_ms": image_time_budget_ms(),
+            "batch_parallelism": batch_parallelism(),
+            "max_image_long_edge": max_image_long_edge(),
+            "span_label_mode": span_label_mode(),
             "candidate_engines": [
                 "tesseract-tsv-local",
                 "rapidocr-onnx-candidate",
@@ -498,7 +502,7 @@ async fn process_batch_job(state: Arc<AppState>, job_id: Uuid, products: Vec<Pro
         }
     }
 
-    let semaphore = Arc::new(Semaphore::new(BATCH_PARALLELISM));
+    let semaphore = Arc::new(Semaphore::new(batch_parallelism()));
     let mut handles = Vec::with_capacity(products.len());
 
     for product in products {
@@ -603,23 +607,62 @@ fn env_flag(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-fn ocr_retry_mode() -> String {
-    match std::env::var("TTB_OCR_RETRY_MODE")
-        .unwrap_or_else(|_| "fast".to_string())
+fn processing_profile() -> String {
+    let configured = std::env::var("TTB_PROCESSING_PROFILE")
+        .or_else(|_| std::env::var("TTB_OCR_RETRY_MODE"))
+        .unwrap_or_else(|_| "adaptive".to_string());
+
+    match configured.trim().to_ascii_lowercase().as_str() {
+        "fast" => "fast".to_string(),
+        "balanced" | "adaptive" => "adaptive".to_string(),
+        "enhanced" => "enhanced".to_string(),
+        _ => "adaptive".to_string(),
+    }
+}
+
+fn image_time_budget_ms() -> u128 {
+    std::env::var("TTB_IMAGE_TIME_BUDGET_MS")
+        .ok()
+        .and_then(|value| value.parse::<u128>().ok())
+        .filter(|value| *value >= 500)
+        .unwrap_or(4500)
+}
+
+fn batch_parallelism() -> usize {
+    std::env::var("TTB_BATCH_PARALLELISM")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=8).contains(value))
+        .unwrap_or(2)
+}
+
+fn max_image_long_edge() -> u32 {
+    std::env::var("TTB_MAX_IMAGE_LONG_EDGE")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value >= 600)
+        .unwrap_or(1800)
+}
+
+fn span_label_mode() -> String {
+    match std::env::var("TTB_SPAN_LABEL_MODE")
+        .unwrap_or_else(|_| "candidate".to_string())
         .trim()
         .to_ascii_lowercase()
         .as_str()
     {
-        "balanced" => "balanced".to_string(),
-        "enhanced" => "enhanced".to_string(),
-        _ => "fast".to_string(),
+        "off" => "off".to_string(),
+        "full" => "full".to_string(),
+        _ => "candidate".to_string(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ttb_core::{BoundingBox, CheckStatus, FieldCheck, TextSpan, Verdict, WarningCheck};
+    use ttb_core::{
+        BoundingBox, CheckStatus, FieldCheck, ProcessingPath, TextSpan, Verdict, WarningCheck,
+    };
 
     fn raw_span() -> TextSpan {
         TextSpan {
@@ -672,6 +715,11 @@ mod tests {
             spans: vec![span],
             span_labels: Vec::new(),
             ocr_passes: Vec::new(),
+            processing_path: ProcessingPath::FastPass,
+            stage_timings: Vec::new(),
+            budget_ms: 4500,
+            budget_exhausted: false,
+            escalation_reason: None,
             engines: vec!["test".to_string()],
             image_count: 1,
             latency_ms: 1,

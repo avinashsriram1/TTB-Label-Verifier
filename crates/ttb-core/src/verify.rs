@@ -4,20 +4,25 @@ use crate::matching::{
     parse_net_contents_ml, similarity, token_overlap,
 };
 use crate::models::{
-    CheckStatus, ExpectedFields, FieldCheck, OcrOutput, OcrPassReport, ProductInput, SpanLabel,
-    SpanLabelKind, TextSpan, Verdict, VerificationResult,
+    CheckStatus, ExpectedFields, FieldCheck, OcrOutput, OcrPassReport, ProcessingPath,
+    ProductInput, SpanLabel, SpanLabelKind, StageTiming, TextSpan, Verdict, VerificationResult,
 };
 use crate::ocr::OcrEngine;
 use crate::warning::check_government_warning;
+use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 pub async fn verify_product(engine: &dyn OcrEngine, product: ProductInput) -> VerificationResult {
     let started = Instant::now();
+    let budget_ms = image_time_budget_ms();
     let mut outputs = Vec::with_capacity(product.images.len());
+    let mut stage_timings = Vec::new();
     let mut notes = Vec::new();
 
     for image in &product.images {
+        let stage_started = Instant::now();
         match engine.read(image).await {
             Ok(output) => outputs.push(output),
             Err(err) => {
@@ -48,8 +53,14 @@ pub async fn verify_product(engine: &dyn OcrEngine, product: ProductInput) -> Ve
                 });
             }
         }
+        record_stage(
+            &mut stage_timings,
+            format!("ocr:{}", image.filename),
+            stage_started,
+        );
     }
 
+    let stage_started = Instant::now();
     let raw_text = outputs
         .iter()
         .map(|output| output.raw_text.as_str())
@@ -69,11 +80,40 @@ pub async fn verify_product(engine: &dyn OcrEngine, product: ProductInput) -> Ve
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+    record_stage(&mut stage_timings, "ocr_merge", stage_started);
 
+    let stage_started = Instant::now();
     let fields = verify_fields(&product.expected, &raw_text, &spans);
+    record_stage(&mut stage_timings, "field_checks", stage_started);
+
+    let stage_started = Instant::now();
     let government_warning = check_government_warning(&raw_text, &spans);
-    let span_labels = label_spans(&product.expected, &spans);
-    let verdict = aggregate_verdict(&fields, &government_warning.status);
+    record_stage(&mut stage_timings, "government_warning", stage_started);
+
+    let stage_started = Instant::now();
+    let span_labels = if started.elapsed().as_millis() >= budget_ms {
+        notes.push("Span labeling skipped because the per-image budget was exhausted.".to_string());
+        Vec::new()
+    } else {
+        label_spans(&product.expected, &spans)
+    };
+    record_stage(&mut stage_timings, "span_labeling", stage_started);
+
+    let mut verdict = aggregate_verdict(&fields, &government_warning.status);
+    let budget_exhausted = started.elapsed().as_millis() >= budget_ms;
+    let processing_path =
+        processing_path(&government_warning.status, &ocr_passes, budget_exhausted);
+    let escalation_reason =
+        escalation_reason(&government_warning.status, &ocr_passes, budget_exhausted);
+
+    if budget_exhausted && matches!(verdict, Verdict::Pass) {
+        verdict = Verdict::Review;
+        notes.push(
+            "Verification exceeded the per-image budget and was routed to review.".to_string(),
+        );
+    }
+
+    record_stage(&mut stage_timings, "total", started);
 
     VerificationResult {
         product_id: product.product_id,
@@ -85,6 +125,11 @@ pub async fn verify_product(engine: &dyn OcrEngine, product: ProductInput) -> Ve
         spans,
         span_labels,
         ocr_passes,
+        processing_path,
+        stage_timings,
+        budget_ms,
+        budget_exhausted,
+        escalation_reason,
         engines,
         image_count: product.images.len(),
         latency_ms: started.elapsed().as_millis(),
@@ -198,7 +243,13 @@ fn check_text_field(
     let sim = evidence
         .first()
         .map(|span| similarity(expected_value, &span.text))
-        .unwrap_or_else(|| similarity(expected_value, raw_text));
+        .unwrap_or_else(|| {
+            if raw_text.len() <= 512 {
+                similarity(expected_value, raw_text)
+            } else {
+                0.0
+            }
+        });
     let confidence = overlap.max(sim);
 
     if confidence >= 0.88 {
@@ -411,18 +462,20 @@ fn contains_word_phrase(raw_norm: &str, phrase_norm: &str) -> bool {
     if phrase_norm.is_empty() {
         return false;
     }
-    let pattern = format!(r"(?:^|\s){}(?:\s|$)", regex::escape(phrase_norm));
-    regex::Regex::new(&pattern)
-        .expect("valid word phrase regex")
-        .is_match(raw_norm)
+    let raw = format!(" {raw_norm} ");
+    let phrase = format!(" {phrase_norm} ");
+    raw.contains(&phrase)
 }
 
 fn contains_us_state_location(raw_text: &str) -> bool {
-    US_STATE_CODES.iter().any(|state| {
-        let pattern = format!(r"(?i)\b[A-Z][A-Za-z .'-]+,\s*{}\b", regex::escape(state));
-        regex::Regex::new(&pattern)
+    us_state_location_regex().is_match(raw_text)
+}
+
+fn us_state_location_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"(?i)\b[A-Z][A-Za-z .'-]+,\s*(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WI|WV|WY|DC)\b")
             .expect("valid US location regex")
-            .is_match(raw_text)
     })
 }
 
@@ -689,14 +742,7 @@ fn detect_observed_class(raw_text: &str) -> Option<ClassAlias> {
 
 fn contains_class_phrase(raw_norm: &str, alias: &str) -> bool {
     let alias_norm = normalize_text(alias);
-    if alias_norm.is_empty() {
-        return false;
-    }
-
-    let pattern = format!(r"(?:^|\s){}(?:\s|$)", regex::escape(&alias_norm));
-    regex::Regex::new(&pattern)
-        .expect("valid class phrase regex")
-        .is_match(raw_norm)
+    contains_word_phrase(raw_norm, &alias_norm)
 }
 
 fn class_evidence(class: ClassAlias, spans: &[TextSpan]) -> Vec<TextSpan> {
@@ -941,26 +987,78 @@ fn numeric_evidence(spans: &[TextSpan], needles: &[&str]) -> Vec<TextSpan> {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpanLabelMode {
+    Off,
+    Candidate,
+    Full,
+}
+
+impl SpanLabelMode {
+    fn from_env() -> Self {
+        match std::env::var("TTB_SPAN_LABEL_MODE")
+            .unwrap_or_else(|_| "candidate".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "off" => Self::Off,
+            "full" => Self::Full,
+            _ => Self::Candidate,
+        }
+    }
+}
+
 fn label_spans(expected: &ExpectedFields, spans: &[TextSpan]) -> Vec<SpanLabel> {
+    let mode = SpanLabelMode::from_env();
+    label_spans_with_mode(expected, spans, mode)
+}
+
+fn label_spans_with_mode(
+    expected: &ExpectedFields,
+    spans: &[TextSpan],
+    mode: SpanLabelMode,
+) -> Vec<SpanLabel> {
+    if matches!(mode, SpanLabelMode::Off) {
+        return Vec::new();
+    }
+
     spans
         .iter()
-        .map(|span| {
-            let norm = normalize_text(&span.text);
-            let (label, confidence, reason) = classify_span(expected, span, &norm).unwrap_or((
-                SpanLabelKind::Other,
-                span.confidence.unwrap_or(35.0) / 100.0,
-                "No V2 span-labeling rule matched.".to_string(),
-            ));
-
-            SpanLabel {
-                image_id: span.image_id.clone(),
-                bbox: span.bbox.clone(),
-                label,
-                confidence: confidence.clamp(0.0, 1.0),
-                reason,
-            }
+        .filter_map(|span| label_span(expected, span, mode))
+        .take(match mode {
+            SpanLabelMode::Off => 0,
+            SpanLabelMode::Candidate => 64,
+            SpanLabelMode::Full => usize::MAX,
         })
         .collect()
+}
+
+fn label_span(
+    expected: &ExpectedFields,
+    span: &TextSpan,
+    mode: SpanLabelMode,
+) -> Option<SpanLabel> {
+    let norm = normalize_text(&span.text);
+    let classified = classify_span(expected, span, &norm);
+
+    let (label, confidence, reason) = match (classified, mode) {
+        (Some(classified), _) => classified,
+        (None, SpanLabelMode::Full) => (
+            SpanLabelKind::Other,
+            span.confidence.unwrap_or(35.0) / 100.0,
+            "No V2 span-labeling rule matched.".to_string(),
+        ),
+        (None, _) => return None,
+    };
+
+    Some(SpanLabel {
+        image_id: span.image_id.clone(),
+        bbox: span.bbox.clone(),
+        label,
+        confidence: confidence.clamp(0.0, 1.0),
+        reason,
+    })
 }
 
 fn classify_span(
@@ -1003,7 +1101,7 @@ fn classify_span(
         ));
     }
 
-    if detect_country(text).is_some() {
+    if span_is_country_candidate(text, norm) {
         return Some((
             SpanLabelKind::Country,
             base_confidence.max(0.82),
@@ -1036,6 +1134,17 @@ fn classify_span(
     None
 }
 
+fn span_is_country_candidate(text: &str, norm: &str) -> bool {
+    COUNTRY_ALIASES.iter().any(|country| {
+        country
+            .aliases
+            .iter()
+            .any(|alias| contains_word_phrase(norm, &normalize_text(alias)))
+    }) || US_STATE_CODES
+        .iter()
+        .any(|state| text.trim().eq_ignore_ascii_case(state))
+}
+
 fn aggregate_verdict(
     fields: &BTreeMap<String, FieldCheck>,
     warning_status: &CheckStatus,
@@ -1057,6 +1166,55 @@ fn aggregate_verdict(
     }
 
     Verdict::Pass
+}
+
+fn processing_path(
+    warning_status: &CheckStatus,
+    ocr_passes: &[OcrPassReport],
+    budget_exhausted: bool,
+) -> ProcessingPath {
+    if budget_exhausted {
+        return ProcessingPath::TimeoutReview;
+    }
+    if ocr_passes.len() > 1 {
+        return ProcessingPath::EnhancedRetry;
+    }
+    if matches!(warning_status, CheckStatus::Review) {
+        return ProcessingPath::CheapRepair;
+    }
+    ProcessingPath::FastPass
+}
+
+fn escalation_reason(
+    warning_status: &CheckStatus,
+    ocr_passes: &[OcrPassReport],
+    budget_exhausted: bool,
+) -> Option<String> {
+    if budget_exhausted {
+        return Some("per_image_budget_exhausted".to_string());
+    }
+    if ocr_passes.len() > 1 {
+        return Some("ocr_quality_gate_triggered_retry".to_string());
+    }
+    if matches!(warning_status, CheckStatus::Review) {
+        return Some("warning_heading_repaired_from_ocr_noise".to_string());
+    }
+    None
+}
+
+fn record_stage(stage_timings: &mut Vec<StageTiming>, stage: impl Into<String>, started: Instant) {
+    stage_timings.push(StageTiming {
+        stage: stage.into(),
+        elapsed_ms: started.elapsed().as_millis(),
+    });
+}
+
+fn image_time_budget_ms() -> u128 {
+    std::env::var("TTB_IMAGE_TIME_BUDGET_MS")
+        .ok()
+        .and_then(|value| value.parse::<u128>().ok())
+        .filter(|value| *value >= 500)
+        .unwrap_or(4500)
 }
 
 #[cfg(test)]
@@ -1240,6 +1398,74 @@ mod tests {
         );
         assert_eq!(check.status, CheckStatus::Review);
         assert_eq!(check.observed.as_deref(), Some("Possible partial match"));
+    }
+
+    #[test]
+    fn noisy_warning_uses_cheap_repair_path() {
+        let warning = check_government_warning("GOVERNMENT WARK: OCR noise", &[]);
+        let path = processing_path(&warning.status, &[], false);
+        assert_eq!(warning.status, CheckStatus::Review);
+        assert_eq!(path, ProcessingPath::CheapRepair);
+        assert_eq!(
+            escalation_reason(&warning.status, &[], false).as_deref(),
+            Some("warning_heading_repaired_from_ocr_noise")
+        );
+    }
+
+    #[test]
+    fn candidate_span_labeling_is_bounded_and_fast() {
+        let spans = (0..120)
+            .map(|index| TextSpan {
+                image_id: "img".to_string(),
+                source_engine: "mock".to_string(),
+                text: if index == 10 {
+                    "GOVERNMENT WARK".to_string()
+                } else if index == 20 {
+                    "12% ALC/VOL".to_string()
+                } else if index == 30 {
+                    "750 ML".to_string()
+                } else {
+                    format!("unrelated noisy span {index}")
+                },
+                confidence: Some(65.0),
+                bbox: None,
+            })
+            .collect::<Vec<_>>();
+        let expected = ExpectedFields {
+            brand_name: Some("Honey Liqueur".to_string()),
+            class_type: Some("Liqueur".to_string()),
+            alcohol_content: Some("12%".to_string()),
+            net_contents: Some("750 ml".to_string()),
+            bottler: None,
+            country: None,
+        };
+
+        let started = Instant::now();
+        let labels = label_spans_with_mode(&expected, &spans, SpanLabelMode::Candidate);
+        let elapsed = started.elapsed();
+
+        assert!(elapsed.as_millis() < 250);
+        assert!(labels.len() <= 64);
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.label == SpanLabelKind::GovernmentWarning)
+        );
+        assert!(
+            labels
+                .iter()
+                .all(|label| label.label != SpanLabelKind::Other)
+        );
+    }
+
+    #[test]
+    fn timeout_budget_sets_timeout_path() {
+        let path = processing_path(&CheckStatus::Pass, &[], true);
+        assert_eq!(path, ProcessingPath::TimeoutReview);
+        assert_eq!(
+            escalation_reason(&CheckStatus::Pass, &[], true).as_deref(),
+            Some("per_image_budget_exhausted")
+        );
     }
 
     #[test]

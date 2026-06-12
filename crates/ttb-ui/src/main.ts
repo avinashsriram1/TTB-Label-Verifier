@@ -47,6 +47,11 @@ type VerificationResult = {
   raw_text: string;
   span_labels: SpanLabel[];
   ocr_passes: OcrPassReport[];
+  processing_path: "fast_pass" | "cheap_repair" | "enhanced_retry" | "timeout_review";
+  stage_timings: { stage: string; elapsed_ms: number }[];
+  budget_ms: number;
+  budget_exhausted: boolean;
+  escalation_reason?: string | null;
   engines: string[];
   image_count: number;
   latency_ms: number;
@@ -66,6 +71,12 @@ type BatchJob = {
 type HealthResponse = {
   security?: { raw_ocr_visible?: boolean };
   corrections?: { enabled?: boolean; durable?: boolean };
+  v2?: {
+    processing_profile?: string;
+    image_time_budget_ms?: number;
+    batch_parallelism?: number;
+    span_label_mode?: string;
+  };
 };
 
 const appElement = document.querySelector<HTMLDivElement>("#app");
@@ -76,6 +87,7 @@ let activeTab: "single" | "batch" | "review" = "single";
 let singleResult: VerificationResult | null = null;
 let currentJob: BatchJob | null = null;
 let reviewQueue: VerificationResult[] = [];
+let singleFormMessage = "";
 let reviewStatusFilter: "all" | "review" | "fail" = "all";
 let reviewReasonFilter: "all" | "warning" | "class_type" | "country" | "low_confidence" = "all";
 let correctionMessage = "";
@@ -83,6 +95,10 @@ let serverConfig = {
   rawOcrVisible: false,
   correctionsEnabled: true,
   correctionsDurable: false,
+  processingProfile: "adaptive",
+  imageTimeBudgetMs: 4500,
+  batchParallelism: 2,
+  spanLabelMode: "candidate",
 };
 let pollTimer: number | undefined;
 
@@ -137,10 +153,11 @@ function renderSingle() {
           <strong>Government warning is checked automatically.</strong>
           <span>The image only needs to show the all-caps GOVERNMENT WARNING heading.</span>
         </div>
-        ${field("brand_name", "Brand name", "Lenz Moser", "The exact brand from the application, such as Lenz Moser. Case does not matter.")}
-        ${field("class_type", "Class / type", "Dry White Wine", "Use a practical class/type like Dry White Wine, Beer, Bourbon Whiskey, Vodka, or Cider.")}
-        ${field("alcohol_content", "Alcohol content", "12%", "Enter the application ABV, such as 12%, 45% Alc./Vol., or 90 Proof if that is what you have.")}
-        ${field("net_contents", "Net contents", "1.0L", "Enter the package size, such as 750 mL, 1.0L, 12 fl oz, or 75 cl.")}
+        ${singleFormMessage ? `<p class="form-error">${escapeHtml(singleFormMessage)}</p>` : ""}
+        ${field("brand_name", "Brand name", "Lenz Moser", "The exact brand from the application, such as Lenz Moser. Case does not matter.", true)}
+        ${field("class_type", "Class / type", "Dry White Wine", "Use a practical class/type like Dry White Wine, Beer, Bourbon Whiskey, Vodka, or Cider.", true)}
+        ${field("alcohol_content", "Alcohol content", "12%", "Enter the application ABV, such as 12%, 45% Alc./Vol., or 90 Proof if that is what you have.", true)}
+        ${field("net_contents", "Net contents", "1.0L", "Enter the package size, such as 750 mL, 1.0L, 12 fl oz, or 75 cl.", true)}
         ${field("bottler", "Bottler / producer", "optional", "Optional producer or bottler text from the application. Leave blank if it is not part of this check.")}
         ${field("country", "Country of origin", "Austria", "Use this for imported products, such as Austria, Mexico, France, or Product of Austria.")}
         <label class="drop">
@@ -232,11 +249,11 @@ function renderReview() {
   `;
 }
 
-function field(name: string, label: string, placeholder: string, helpText: string) {
+function field(name: string, label: string, placeholder: string, helpText: string, required = false) {
   return `
     <label>
       <span>${label} ${help(helpText)}</span>
-      <input name="${name}" placeholder="${placeholder}" />
+      <input name="${name}" placeholder="${placeholder}" ${required ? "required aria-required=\"true\"" : ""} autocomplete="off" />
     </label>
   `;
 }
@@ -305,11 +322,16 @@ function renderResult(result: VerificationResult) {
         <summary>OCR/debug details</summary>
         <div class="debug-grid">
           <span>Processing time</span><strong>${formatDuration(result.latency_ms)}</strong>
+          <span>Processing path</span><strong>${labelFor(result.processing_path || "fast_pass")}</strong>
+          <span>Budget</span><strong>${formatDuration(result.budget_ms || serverConfig.imageTimeBudgetMs)}</strong>
+          <span>Budget status</span><strong>${result.budget_exhausted ? "exhausted" : "within budget"}</strong>
+          ${result.escalation_reason ? `<span>Escalation</span><strong>${escapeHtml(result.escalation_reason)}</strong>` : ""}
           <span>OCR engine</span><strong>${escapeHtml(result.engines?.join(", ") || "unknown")}</strong>
           <span>Images processed</span><strong>${result.image_count}</strong>
           <span>OCR passes</span><strong>${result.ocr_passes?.length ?? 0}</strong>
           <span>Span labels</span><strong>${summarizeSpanLabels(result.span_labels ?? [])}</strong>
         </div>
+        ${renderStageTimings(result.stage_timings ?? [])}
         ${renderOcrPasses(result.ocr_passes ?? [])}
         ${
           serverConfig.rawOcrVisible
@@ -334,13 +356,27 @@ function renderOcrPasses(passes: OcrPassReport[]) {
             (pass) => `
               <tr>
                 <td>${escapeHtml(pass.profile)}</td>
-                <td>${pass.rotation_degrees}°</td>
+                <td>${pass.rotation_degrees} deg</td>
                 <td>${formatDuration(pass.elapsed_ms)}</td>
                 <td>${pass.mean_confidence == null ? "" : `${pass.mean_confidence.toFixed(1)}%`}</td>
                 <td>${pass.warning_heading_detected ? "Found" : pass.error ? "Error" : "Not found"}</td>
               </tr>
             `,
           )
+          .join("")}
+      </tbody>
+    </table>
+  `;
+}
+
+function renderStageTimings(timings: { stage: string; elapsed_ms: number }[]) {
+  if (!timings.length) return "";
+  return `
+    <table class="pass-table">
+      <thead><tr><th>Stage</th><th>Time</th></tr></thead>
+      <tbody>
+        ${timings
+          .map((timing) => `<tr><td>${escapeHtml(timing.stage)}</td><td>${formatDuration(timing.elapsed_ms)}</td></tr>`)
           .join("")}
       </tbody>
     </table>
@@ -399,12 +435,40 @@ function bindSingle() {
   document.querySelector<HTMLFormElement>("#single-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget as HTMLFormElement;
+    const validationError = validateSingleForm(form);
+    if (validationError) {
+      singleFormMessage = validationError;
+      render();
+      return;
+    }
+    singleFormMessage = "";
     const data = new FormData(form);
     normalizeImageField(data);
     singleResult = await postJson<VerificationResult>("/api/verify", data);
     mergeReviewResults([singleResult]);
     render();
   });
+}
+
+function validateSingleForm(form: HTMLFormElement) {
+  const data = new FormData(form);
+  const requiredFields = [
+    ["brand_name", "Brand name"],
+    ["class_type", "Class / type"],
+    ["alcohol_content", "Alcohol content"],
+    ["net_contents", "Net contents"],
+  ] as const;
+
+  for (const [name, label] of requiredFields) {
+    const value = String(data.get(name) || "").trim();
+    if (!value) {
+      return `${label} is required before OCR runs. Placeholder examples are not submitted as values.`;
+    }
+  }
+
+  const files = data.getAll("images").filter((file) => file instanceof File && file.size > 0);
+  if (!files.length) return "Upload at least one label image before running verification.";
+  return "";
 }
 
 function bindBatch() {
@@ -541,6 +605,10 @@ async function loadServerConfig() {
     rawOcrVisible: Boolean(health.security?.raw_ocr_visible),
     correctionsEnabled: health.corrections?.enabled !== false,
     correctionsDurable: Boolean(health.corrections?.durable),
+    processingProfile: health.v2?.processing_profile || "adaptive",
+    imageTimeBudgetMs: health.v2?.image_time_budget_ms || 4500,
+    batchParallelism: health.v2?.batch_parallelism || 2,
+    spanLabelMode: health.v2?.span_label_mode || "candidate",
   };
   render();
 }

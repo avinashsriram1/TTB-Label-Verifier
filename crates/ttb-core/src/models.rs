@@ -87,6 +87,21 @@ pub struct OcrOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum ProcessingPath {
+    FastPass,
+    CheapRepair,
+    EnhancedRetry,
+    TimeoutReview,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageTiming {
+    pub stage: String,
+    pub elapsed_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum SpanLabelKind {
     BrandName,
     ClassType,
@@ -142,6 +157,11 @@ pub struct VerificationResult {
     pub spans: Vec<TextSpan>,
     pub span_labels: Vec<SpanLabel>,
     pub ocr_passes: Vec<OcrPassReport>,
+    pub processing_path: ProcessingPath,
+    pub stage_timings: Vec<StageTiming>,
+    pub budget_ms: u128,
+    pub budget_exhausted: bool,
+    pub escalation_reason: Option<String>,
     pub engines: Vec<String>,
     pub image_count: usize,
     pub latency_ms: u128,
