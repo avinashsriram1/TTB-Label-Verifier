@@ -1,0 +1,11 @@
+[
+  {
+    "product": "Old Tom Bourbon 750",
+    "images": ["old-tom-front.png", "old-tom-back.png"],
+    "brand_name": "Old Tom Distillery",
+    "class_type": "Kentucky Straight Bourbon Whiskey",
+    "alcohol_content": "45% Alc./Vol.",
+    "net_contents": "750 mL"
+  }
+]
+

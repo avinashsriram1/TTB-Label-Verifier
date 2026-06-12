@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ttb-core",
+    "crates/ttb-api",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["TTB Label Verifier"]
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+csv = "1.3"
+image = "0.25"
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+strsim = "0.11"
+tempfile = "3.15"
+thiserror = "2.0"
+tokio = { version = "1.43", features = ["full"] }
+uuid = { version = "1.12", features = ["v4", "serde"] }

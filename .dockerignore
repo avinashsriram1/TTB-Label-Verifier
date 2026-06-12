@@ -1,0 +1,8 @@
+target
+.git
+crates/ttb-ui/node_modules
+crates/ttb-ui/dist
+.tmp
+*.log
+.env
+

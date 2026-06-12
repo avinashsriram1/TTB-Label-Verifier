@@ -1,0 +1,22 @@
+[package]
+name = "ttb-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+csv.workspace = true
+image.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+strsim.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

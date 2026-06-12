@@ -1,0 +1,10 @@
+/target/
+/crates/ttb-ui/dist/
+/crates/ttb-ui/node_modules/
+/crates/ttb-ui/.vite/
+/.tmp/
+*.log
+.env
+.DS_Store
+Thumbs.db
+
