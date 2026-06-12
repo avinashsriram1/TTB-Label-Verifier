@@ -197,6 +197,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "v2": {
             "ocr_pass_reports": true,
             "span_labeling": "heuristic_baseline",
+            "ocr_retry_mode": ocr_retry_mode(),
             "candidate_engines": [
                 "tesseract-tsv-local",
                 "rapidocr-onnx-candidate",
@@ -600,6 +601,19 @@ fn env_flag(name: &str, default: bool) -> bool {
             )
         })
         .unwrap_or(default)
+}
+
+fn ocr_retry_mode() -> String {
+    match std::env::var("TTB_OCR_RETRY_MODE")
+        .unwrap_or_else(|_| "fast".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "balanced" => "balanced".to_string(),
+        "enhanced" => "enhanced".to_string(),
+        _ => "fast".to_string(),
+    }
 }
 
 #[cfg(test)]

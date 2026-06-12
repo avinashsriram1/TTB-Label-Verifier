@@ -272,6 +272,10 @@ Runtime flags:
 
 - `TTB_SHOW_RAW_OCR=true` exposes raw OCR in API/UI debug output for local debugging.
   The default is `false`.
+- `TTB_OCR_RETRY_MODE=fast|balanced|enhanced` controls local OCR retries. The
+  default is `fast`, which runs the primary OCR pass only for V1-like speed.
+  Use `balanced` for contrast plus side-rotation retries, or `enhanced` for the
+  full preprocessing and rotation set on difficult labels.
 - `TTB_CORRECTIONS_PATH=./tmp/corrections.ndjson` appends structured correction
   records to newline-delimited JSON. If unset, corrections stay in memory only.
 

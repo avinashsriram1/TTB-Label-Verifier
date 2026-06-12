@@ -68,8 +68,9 @@ impl OcrEngine for TesseractCliEngine {
         raw_parts.push(primary.raw_text);
         all_spans.extend(primary.spans);
 
-        if should_retry_ocr(&passes) {
-            for variant in retry_variants(&image.bytes, &image.image_id) {
+        let retry_mode = OcrRetryMode::from_env();
+        if should_retry_ocr(&passes, retry_mode) {
+            for variant in retry_variants(&image.bytes, &image.image_id, retry_mode) {
                 let variant = match variant {
                     Ok(variant) => variant,
                     Err(err) => {
@@ -143,6 +144,28 @@ struct OcrRetryVariant {
     bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OcrRetryMode {
+    Fast,
+    Balanced,
+    Enhanced,
+}
+
+impl OcrRetryMode {
+    fn from_env() -> Self {
+        match std::env::var("TTB_OCR_RETRY_MODE")
+            .unwrap_or_else(|_| "fast".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "balanced" => Self::Balanced,
+            "enhanced" => Self::Enhanced,
+            _ => Self::Fast,
+        }
+    }
+}
+
 async fn run_tesseract_bytes(
     bytes: &[u8],
     image_id: &str,
@@ -200,32 +223,47 @@ async fn run_tesseract_bytes(
     })
 }
 
-fn should_retry_ocr(passes: &[OcrPassReport]) -> bool {
+fn should_retry_ocr(passes: &[OcrPassReport], mode: OcrRetryMode) -> bool {
     let Some(primary) = passes.first() else {
         return false;
     };
 
-    !primary.warning_heading_detected || primary.mean_confidence.unwrap_or(0.0) < 55.0
+    !matches!(mode, OcrRetryMode::Fast)
+        && (!primary.warning_heading_detected || primary.mean_confidence.unwrap_or(0.0) < 55.0)
 }
 
-fn retry_variants(bytes: &[u8], image_id: &str) -> Vec<Result<OcrRetryVariant>> {
-    [
-        ("contrast", 0),
-        ("threshold", 0),
-        ("original", 90),
-        ("original", 180),
-        ("original", 270),
-    ]
-    .into_iter()
-    .map(|(profile, rotation_degrees)| {
-        prepare_variant(bytes, profile, rotation_degrees).map(|bytes| OcrRetryVariant {
-            image_id: format!("{image_id}-{profile}-rot{rotation_degrees}"),
-            profile,
-            rotation_degrees,
-            bytes,
+fn retry_profiles(mode: OcrRetryMode) -> &'static [(&'static str, u16)] {
+    match mode {
+        OcrRetryMode::Fast => &[],
+        OcrRetryMode::Balanced => &[("contrast", 0), ("original", 90), ("original", 270)],
+        OcrRetryMode::Enhanced => &[
+            ("contrast", 0),
+            ("threshold", 0),
+            ("original", 90),
+            ("original", 180),
+            ("original", 270),
+        ],
+    }
+}
+
+fn retry_variants(
+    bytes: &[u8],
+    image_id: &str,
+    mode: OcrRetryMode,
+) -> Vec<Result<OcrRetryVariant>> {
+    retry_profiles(mode)
+        .iter()
+        .copied()
+        .into_iter()
+        .map(|(profile, rotation_degrees)| {
+            prepare_variant(bytes, profile, rotation_degrees).map(|bytes| OcrRetryVariant {
+                image_id: format!("{image_id}-{profile}-rot{rotation_degrees}"),
+                profile,
+                rotation_degrees,
+                bytes,
+            })
         })
-    })
-    .collect()
+        .collect()
 }
 
 fn prepare_variant(bytes: &[u8], profile: &'static str, rotation_degrees: u16) -> Result<Vec<u8>> {
@@ -364,7 +402,7 @@ mod tests {
 
     #[test]
     fn low_confidence_or_missing_warning_triggers_retry() {
-        assert!(should_retry_ocr(&[OcrPassReport {
+        let missing_warning = [OcrPassReport {
             image_id: "img".to_string(),
             profile: "original".to_string(),
             rotation_degrees: 0,
@@ -373,17 +411,17 @@ mod tests {
             mean_confidence: Some(90.0),
             warning_heading_detected: false,
             error: None,
-        }]));
+        }];
 
-        assert!(!should_retry_ocr(&[OcrPassReport {
-            image_id: "img".to_string(),
-            profile: "original".to_string(),
-            rotation_degrees: 0,
-            elapsed_ms: 1,
-            span_count: 1,
-            mean_confidence: Some(90.0),
-            warning_heading_detected: true,
-            error: None,
-        }]));
+        assert!(!should_retry_ocr(&missing_warning, OcrRetryMode::Fast));
+        assert!(should_retry_ocr(&missing_warning, OcrRetryMode::Balanced));
+        assert!(should_retry_ocr(&missing_warning, OcrRetryMode::Enhanced));
+    }
+
+    #[test]
+    fn retry_mode_controls_number_of_variants() {
+        assert_eq!(retry_profiles(OcrRetryMode::Fast).len(), 0);
+        assert_eq!(retry_profiles(OcrRetryMode::Balanced).len(), 3);
+        assert_eq!(retry_profiles(OcrRetryMode::Enhanced).len(), 5);
     }
 }
