@@ -1,4 +1,5 @@
 use regex::Regex;
+use std::sync::OnceLock;
 use strsim::normalized_levenshtein;
 
 pub fn normalize_text(input: &str) -> String {
@@ -99,13 +100,11 @@ pub fn is_proper_token_subset(shorter: &str, longer: &str) -> bool {
 }
 
 pub fn parse_abv_value(input: &str) -> Option<f32> {
-    let percent = Regex::new(r"(?i)(\d{1,2}(?:\.\d+)?)\s*%").ok()?;
-    if let Some(caps) = percent.captures(input) {
+    if let Some(caps) = percent_regex().captures(input) {
         return caps.get(1)?.as_str().parse::<f32>().ok();
     }
 
-    let proof = Regex::new(r"(?i)(\d{2,3}(?:\.\d+)?)\s*proof").ok()?;
-    if let Some(caps) = proof.captures(input) {
+    if let Some(caps) = proof_regex().captures(input) {
         return caps
             .get(1)?
             .as_str()
@@ -114,26 +113,21 @@ pub fn parse_abv_value(input: &str) -> Option<f32> {
             .map(|value| value / 2.0);
     }
 
-    let number = Regex::new(r"(\d{1,2}(?:\.\d+)?)").ok()?;
-    number
+    number_regex()
         .captures(input)
         .and_then(|caps| caps.get(1)?.as_str().parse::<f32>().ok())
 }
 
 pub fn extract_abv_candidates(input: &str) -> Vec<f32> {
-    let re = Regex::new(
-        r"(?i)(\d{1,2}(?:\.\d+)?)\s*%\s*(?:alc\.?\s*/?\s*vol\.?|alcohol\s+by\s+volume|abv|by\s+vol\.?)?",
-    )
-    .expect("valid ABV regex");
-
-    re.captures_iter(input)
+    abv_regex()
+        .captures_iter(input)
         .filter_map(|caps| caps.get(1)?.as_str().parse::<f32>().ok())
         .collect()
 }
 
 pub fn extract_proof_candidates(input: &str) -> Vec<f32> {
-    let re = Regex::new(r"(?i)(\d{2,3}(?:\.\d+)?)\s*proof").expect("valid proof regex");
-    re.captures_iter(input)
+    proof_regex()
+        .captures_iter(input)
         .filter_map(|caps| caps.get(1)?.as_str().parse::<f32>().ok())
         .collect()
 }
@@ -143,12 +137,8 @@ pub fn parse_net_contents_ml(input: &str) -> Option<f32> {
 }
 
 pub fn extract_net_contents_candidates(input: &str) -> Vec<f32> {
-    let re = Regex::new(
-        r"(?i)(\d+(?:\.\d+)?)\s*(ml|milliliters?|milli?litres?|milli?liters?|l|liters?|litres?|cl|fl\.?\s*oz\.?|fluid\s+ounces?|oz)",
-    )
-    .expect("valid net contents regex");
-
-    re.captures_iter(input)
+    net_contents_regex()
+        .captures_iter(input)
         .filter_map(|caps| {
             let qty = caps.get(1)?.as_str().parse::<f32>().ok()?;
             let unit = caps.get(2)?.as_str().to_lowercase();
@@ -167,6 +157,41 @@ pub fn extract_net_contents_candidates(input: &str) -> Vec<f32> {
             Some(ml)
         })
         .collect()
+}
+
+fn percent_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?i)(\d{1,2}(?:\.\d+)?)\s*%").expect("valid percent regex"))
+}
+
+fn proof_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?i)(\d{2,3}(?:\.\d+)?)\s*proof").expect("valid proof regex"))
+}
+
+fn number_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(\d{1,2}(?:\.\d+)?)").expect("valid number regex"))
+}
+
+fn abv_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(
+            r"(?i)(\d{1,2}(?:\.\d+)?)\s*%\s*(?:alc\.?\s*/?\s*vol\.?|alcohol\s+by\s+volume|abv|by\s+vol\.?)?",
+        )
+        .expect("valid ABV regex")
+    })
+}
+
+fn net_contents_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(
+            r"(?i)(\d+(?:\.\d+)?)\s*(ml|milliliters?|milli?litres?|milli?liters?|l|liters?|litres?|cl|fl\.?\s*oz\.?|fluid\s+ounces?|oz)",
+        )
+        .expect("valid net contents regex")
+    })
 }
 
 pub fn summarize_text(input: &str, max_chars: usize) -> String {
