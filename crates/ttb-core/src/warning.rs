@@ -1,12 +1,13 @@
 use crate::matching::normalize_text;
 use crate::models::{CheckStatus, TextSpan, WarningCheck};
 use regex::Regex;
-use std::sync::OnceLock;
 
 pub const CANONICAL_WARNING: &str = "GOVERNMENT WARNING: (1) According to the Surgeon General, women should not drink alcoholic beverages during pregnancy because of the risk of birth defects. (2) Consumption of alcoholic beverages impairs your ability to drive a car or operate machinery, and may cause health problems.";
 
 pub fn check_government_warning(raw_text: &str, spans: &[TextSpan]) -> WarningCheck {
-    let matched_heading = heading_ci_regex().find(raw_text);
+    let heading_ci = Regex::new(r"(?i)government\s+warning").expect("valid heading regex");
+    let heading_caps = Regex::new(r"GOVERNMENT\s+WARNING").expect("valid caps heading regex");
+    let matched_heading = heading_ci.find(raw_text);
 
     let evidence = spans
         .iter()
@@ -23,23 +24,6 @@ pub fn check_government_warning(raw_text: &str, spans: &[TextSpan]) -> WarningCh
         .collect::<Vec<_>>();
 
     let Some(heading_match) = matched_heading else {
-        if let Some(fuzzy_match) = fuzzy_caps_heading_regex().find(raw_text) {
-            let found_text = raw_text[fuzzy_match.start()..].trim().to_string();
-            return WarningCheck {
-                present: true,
-                status: CheckStatus::Review,
-                found_text: Some(found_text),
-                heading_all_caps: Some(true),
-                bold_confirmed: None,
-                wording_similarity: 0.65,
-                detail: "Possible government warning heading found with OCR noise.".to_string(),
-                issues: vec![
-                    "The heading appears to be all caps, but OCR did not read it exactly as GOVERNMENT WARNING.".to_string(),
-                ],
-                evidence,
-            };
-        }
-
         return WarningCheck {
             present: false,
             status: CheckStatus::Fail,
@@ -56,7 +40,7 @@ pub fn check_government_warning(raw_text: &str, spans: &[TextSpan]) -> WarningCh
     };
 
     let heading_text = &raw_text[heading_match.start()..heading_match.end()];
-    let all_caps = heading_caps_regex().is_match(heading_text);
+    let all_caps = heading_caps.is_match(heading_text);
     let found_text = raw_text[heading_match.start()..].trim().to_string();
 
     if !all_caps {
@@ -86,23 +70,6 @@ pub fn check_government_warning(raw_text: &str, spans: &[TextSpan]) -> WarningCh
         issues: Vec::new(),
         evidence,
     }
-}
-
-fn heading_ci_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| Regex::new(r"(?i)government\s+warning").expect("valid heading regex"))
-}
-
-fn heading_caps_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| Regex::new(r"GOVERNMENT\s+WARNING").expect("valid caps heading regex"))
-}
-
-fn fuzzy_caps_heading_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(r"\bGOVERNMENT\s+WA[A-Z]{2,5}\b").expect("valid fuzzy caps heading regex")
-    })
 }
 
 #[cfg(test)]
@@ -137,13 +104,5 @@ mod tests {
         let text = "GOVERNMENT WARNING: Drinking may be risky.";
         let result = check_government_warning(text, &[]);
         assert_eq!(result.status, CheckStatus::Pass);
-    }
-
-    #[test]
-    fn reviews_ocr_noisy_all_caps_heading() {
-        let result = check_government_warning("GOVERNMENT WARNK: OCR noise", &[]);
-        assert!(result.present);
-        assert_eq!(result.status, CheckStatus::Review);
-        assert_eq!(result.heading_all_caps, Some(true));
     }
 }
