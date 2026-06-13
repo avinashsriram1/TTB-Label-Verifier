@@ -4,20 +4,27 @@ use crate::matching::{
     parse_net_contents_ml, similarity, token_overlap,
 };
 use crate::models::{
-    CheckStatus, ExpectedFields, FieldCheck, OcrOutput, ProductInput, TextSpan, Verdict,
-    VerificationResult,
+    CheckStatus, ExpectedFields, FieldCheck, OcrOutput, OcrPassReport, ProcessingPath,
+    ProductInput, SpanLabel, SpanLabelKind, StageTiming, TextSpan, Verdict, VerificationResult,
+    WarningCheck,
 };
 use crate::ocr::OcrEngine;
 use crate::warning::check_government_warning;
+use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Instant;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+use tokio::time::timeout;
 
 pub async fn verify_product(engine: &dyn OcrEngine, product: ProductInput) -> VerificationResult {
     let started = Instant::now();
+    let budget_ms = image_time_budget_ms();
     let mut outputs = Vec::with_capacity(product.images.len());
+    let mut stage_timings = Vec::new();
     let mut notes = Vec::new();
 
     for image in &product.images {
+        let stage_started = Instant::now();
         match engine.read(image).await {
             Ok(output) => outputs.push(output),
             Err(err) => {
@@ -33,13 +40,198 @@ pub async fn verify_product(engine: &dyn OcrEngine, product: ProductInput) -> Ve
                     engine: engine.name().to_string(),
                     raw_text: String::new(),
                     spans: Vec::new(),
+                    passes: vec![OcrPassReport {
+                        image_id: image.image_id.clone(),
+                        profile: "failed".to_string(),
+                        rotation_degrees: 0,
+                        elapsed_ms: 0,
+                        span_count: 0,
+                        mean_confidence: None,
+                        warning_heading_detected: false,
+                        error: Some(err.to_string()),
+                    }],
                     warnings: vec![err.to_string()],
                     elapsed_ms: 0,
                 });
             }
         }
+        record_stage(
+            &mut stage_timings,
+            format!("ocr:{}", image.filename),
+            stage_started,
+        );
     }
 
+    let mut evaluation = evaluate_outputs(
+        "initial",
+        &product.expected,
+        &outputs,
+        started,
+        budget_ms,
+        &mut notes,
+        &mut stage_timings,
+    );
+
+    let mut enhanced_retry_ran = false;
+    if matches!(evaluation.verdict, Verdict::Fail) && !evaluation.budget_exhausted {
+        notes.push("First-pass failure triggered one enhanced OCR retry.".to_string());
+        let mut enhanced_outputs = Vec::new();
+        for image in &product.images {
+            let remaining = budget_ms.saturating_sub(started.elapsed().as_millis());
+            if remaining <= 500 {
+                notes.push(format!(
+                    "Enhanced OCR retry skipped for {} because the per-image budget was nearly exhausted.",
+                    image.filename
+                ));
+                break;
+            }
+
+            let stage_started = Instant::now();
+            let enhanced = timeout(
+                Duration::from_millis(remaining as u64),
+                engine.read_enhanced_retry(image),
+            )
+            .await;
+            match enhanced {
+                Ok(Ok(output)) => {
+                    enhanced_retry_ran = true;
+                    enhanced_outputs.push(output);
+                }
+                Ok(Err(err)) => {
+                    enhanced_retry_ran = true;
+                    notes.push(format!(
+                        "Enhanced OCR retry failed for {} using {}: {}",
+                        image.filename,
+                        engine.name(),
+                        err
+                    ));
+                    enhanced_outputs.push(OcrOutput {
+                        image_id: image.image_id.clone(),
+                        filename: image.filename.clone(),
+                        engine: engine.name().to_string(),
+                        raw_text: String::new(),
+                        spans: Vec::new(),
+                        passes: vec![OcrPassReport {
+                            image_id: format!("{}-enhanced", image.image_id),
+                            profile: "enhanced_failed".to_string(),
+                            rotation_degrees: 0,
+                            elapsed_ms: 0,
+                            span_count: 0,
+                            mean_confidence: None,
+                            warning_heading_detected: false,
+                            error: Some(err.to_string()),
+                        }],
+                        warnings: vec![err.to_string()],
+                        elapsed_ms: 0,
+                    });
+                }
+                Err(_) => {
+                    enhanced_retry_ran = true;
+                    let message = format!("enhanced OCR retry timed out after {remaining} ms");
+                    notes.push(format!("{} for {}", message, image.filename));
+                    enhanced_outputs.push(OcrOutput {
+                        image_id: image.image_id.clone(),
+                        filename: image.filename.clone(),
+                        engine: engine.name().to_string(),
+                        raw_text: String::new(),
+                        spans: Vec::new(),
+                        passes: vec![OcrPassReport {
+                            image_id: format!("{}-enhanced", image.image_id),
+                            profile: "enhanced_timeout".to_string(),
+                            rotation_degrees: 0,
+                            elapsed_ms: remaining,
+                            span_count: 0,
+                            mean_confidence: None,
+                            warning_heading_detected: false,
+                            error: Some(message),
+                        }],
+                        warnings: vec!["Enhanced OCR retry timed out.".to_string()],
+                        elapsed_ms: remaining,
+                    });
+                }
+            }
+            record_stage(
+                &mut stage_timings,
+                format!("enhanced_ocr:{}", image.filename),
+                stage_started,
+            );
+        }
+
+        if !enhanced_outputs.is_empty() {
+            outputs.extend(enhanced_outputs);
+            evaluation = evaluate_outputs(
+                "enhanced",
+                &product.expected,
+                &outputs,
+                started,
+                budget_ms,
+                &mut notes,
+                &mut stage_timings,
+            );
+        }
+    }
+
+    if enhanced_retry_ran && !evaluation.budget_exhausted {
+        evaluation.processing_path = ProcessingPath::EnhancedRetry;
+        evaluation.escalation_reason =
+            Some("first_pass_failure_triggered_enhanced_retry".to_string());
+    }
+
+    if evaluation.budget_exhausted && matches!(evaluation.verdict, Verdict::Pass) {
+        evaluation.verdict = Verdict::Review;
+        notes.push(
+            "Verification exceeded the per-image budget and was routed to review.".to_string(),
+        );
+    }
+
+    record_stage(&mut stage_timings, "total", started);
+
+    VerificationResult {
+        product_id: product.product_id,
+        label: product.label,
+        verdict: evaluation.verdict,
+        fields: evaluation.fields,
+        government_warning: evaluation.government_warning,
+        raw_text: evaluation.raw_text,
+        spans: evaluation.spans,
+        span_labels: evaluation.span_labels,
+        ocr_passes: evaluation.ocr_passes,
+        processing_path: evaluation.processing_path,
+        stage_timings,
+        budget_ms,
+        budget_exhausted: evaluation.budget_exhausted,
+        escalation_reason: evaluation.escalation_reason,
+        engines: evaluation.engines,
+        image_count: product.images.len(),
+        latency_ms: started.elapsed().as_millis(),
+        notes,
+    }
+}
+
+struct OutputEvaluation {
+    raw_text: String,
+    spans: Vec<TextSpan>,
+    ocr_passes: Vec<OcrPassReport>,
+    engines: Vec<String>,
+    fields: BTreeMap<String, FieldCheck>,
+    government_warning: WarningCheck,
+    span_labels: Vec<SpanLabel>,
+    verdict: Verdict,
+    budget_exhausted: bool,
+    processing_path: ProcessingPath,
+    escalation_reason: Option<String>,
+}
+
+fn evaluate_outputs(
+    phase: &str,
+    expected: &ExpectedFields,
+    outputs: &[OcrOutput],
+    started: Instant,
+    budget_ms: u128,
+    notes: &mut Vec<String>,
+    stage_timings: &mut Vec<StageTiming>,
+) -> OutputEvaluation {
+    let stage_started = Instant::now();
     let raw_text = outputs
         .iter()
         .map(|output| output.raw_text.as_str())
@@ -49,29 +241,66 @@ pub async fn verify_product(engine: &dyn OcrEngine, product: ProductInput) -> Ve
         .iter()
         .flat_map(|output| output.spans.clone())
         .collect::<Vec<_>>();
+    let ocr_passes = outputs
+        .iter()
+        .flat_map(|output| output.passes.clone())
+        .collect::<Vec<_>>();
     let engines = outputs
         .iter()
         .map(|output| output.engine.clone())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+    record_stage(stage_timings, format!("{phase}:ocr_merge"), stage_started);
 
-    let fields = verify_fields(&product.expected, &raw_text, &spans);
+    let stage_started = Instant::now();
+    let fields = verify_fields(expected, &raw_text, &spans);
+    record_stage(
+        stage_timings,
+        format!("{phase}:field_checks"),
+        stage_started,
+    );
+
+    let stage_started = Instant::now();
     let government_warning = check_government_warning(&raw_text, &spans);
-    let verdict = aggregate_verdict(&fields, &government_warning.status);
+    record_stage(
+        stage_timings,
+        format!("{phase}:government_warning"),
+        stage_started,
+    );
 
-    VerificationResult {
-        product_id: product.product_id,
-        label: product.label,
-        verdict,
-        fields,
-        government_warning,
+    let stage_started = Instant::now();
+    let span_labels = if started.elapsed().as_millis() >= budget_ms {
+        notes.push("Span labeling skipped because the per-image budget was exhausted.".to_string());
+        Vec::new()
+    } else {
+        label_spans(expected, &spans)
+    };
+    record_stage(
+        stage_timings,
+        format!("{phase}:span_labeling"),
+        stage_started,
+    );
+
+    let verdict = aggregate_verdict(&fields, &government_warning.status);
+    let budget_exhausted = started.elapsed().as_millis() >= budget_ms;
+    let processing_path =
+        processing_path(&government_warning.status, &ocr_passes, budget_exhausted);
+    let escalation_reason =
+        escalation_reason(&government_warning.status, &ocr_passes, budget_exhausted);
+
+    OutputEvaluation {
         raw_text,
         spans,
+        ocr_passes,
         engines,
-        image_count: product.images.len(),
-        latency_ms: started.elapsed().as_millis(),
-        notes,
+        fields,
+        government_warning,
+        span_labels,
+        verdict,
+        budget_exhausted,
+        processing_path,
+        escalation_reason,
     }
 }
 
@@ -181,7 +410,13 @@ fn check_text_field(
     let sim = evidence
         .first()
         .map(|span| similarity(expected_value, &span.text))
-        .unwrap_or_else(|| similarity(expected_value, raw_text));
+        .unwrap_or_else(|| {
+            if raw_text.len() <= 512 {
+                similarity(expected_value, raw_text)
+            } else {
+                0.0
+            }
+        });
     let confidence = overlap.max(sim);
 
     if confidence >= 0.88 {
@@ -394,18 +629,20 @@ fn contains_word_phrase(raw_norm: &str, phrase_norm: &str) -> bool {
     if phrase_norm.is_empty() {
         return false;
     }
-    let pattern = format!(r"(?:^|\s){}(?:\s|$)", regex::escape(phrase_norm));
-    regex::Regex::new(&pattern)
-        .expect("valid word phrase regex")
-        .is_match(raw_norm)
+    let raw = format!(" {raw_norm} ");
+    let phrase = format!(" {phrase_norm} ");
+    raw.contains(&phrase)
 }
 
 fn contains_us_state_location(raw_text: &str) -> bool {
-    US_STATE_CODES.iter().any(|state| {
-        let pattern = format!(r"(?i)\b[A-Z][A-Za-z .'-]+,\s*{}\b", regex::escape(state));
-        regex::Regex::new(&pattern)
+    us_state_location_regex().is_match(raw_text)
+}
+
+fn us_state_location_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"(?i)\b[A-Z][A-Za-z .'-]+,\s*(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WI|WV|WY|DC)\b")
             .expect("valid US location regex")
-            .is_match(raw_text)
     })
 }
 
@@ -672,14 +909,7 @@ fn detect_observed_class(raw_text: &str) -> Option<ClassAlias> {
 
 fn contains_class_phrase(raw_norm: &str, alias: &str) -> bool {
     let alias_norm = normalize_text(alias);
-    if alias_norm.is_empty() {
-        return false;
-    }
-
-    let pattern = format!(r"(?:^|\s){}(?:\s|$)", regex::escape(&alias_norm));
-    regex::Regex::new(&pattern)
-        .expect("valid class phrase regex")
-        .is_match(raw_norm)
+    contains_word_phrase(raw_norm, &alias_norm)
 }
 
 fn class_evidence(class: ClassAlias, spans: &[TextSpan]) -> Vec<TextSpan> {
@@ -924,6 +1154,164 @@ fn numeric_evidence(spans: &[TextSpan], needles: &[&str]) -> Vec<TextSpan> {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpanLabelMode {
+    Off,
+    Candidate,
+    Full,
+}
+
+impl SpanLabelMode {
+    fn from_env() -> Self {
+        match std::env::var("TTB_SPAN_LABEL_MODE")
+            .unwrap_or_else(|_| "candidate".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "off" => Self::Off,
+            "full" => Self::Full,
+            _ => Self::Candidate,
+        }
+    }
+}
+
+fn label_spans(expected: &ExpectedFields, spans: &[TextSpan]) -> Vec<SpanLabel> {
+    let mode = SpanLabelMode::from_env();
+    label_spans_with_mode(expected, spans, mode)
+}
+
+fn label_spans_with_mode(
+    expected: &ExpectedFields,
+    spans: &[TextSpan],
+    mode: SpanLabelMode,
+) -> Vec<SpanLabel> {
+    if matches!(mode, SpanLabelMode::Off) {
+        return Vec::new();
+    }
+
+    spans
+        .iter()
+        .filter_map(|span| label_span(expected, span, mode))
+        .take(match mode {
+            SpanLabelMode::Off => 0,
+            SpanLabelMode::Candidate => 64,
+            SpanLabelMode::Full => usize::MAX,
+        })
+        .collect()
+}
+
+fn label_span(
+    expected: &ExpectedFields,
+    span: &TextSpan,
+    mode: SpanLabelMode,
+) -> Option<SpanLabel> {
+    let norm = normalize_text(&span.text);
+    let classified = classify_span(expected, span, &norm);
+
+    let (label, confidence, reason) = match (classified, mode) {
+        (Some(classified), _) => classified,
+        (None, SpanLabelMode::Full) => (
+            SpanLabelKind::Other,
+            span.confidence.unwrap_or(35.0) / 100.0,
+            "No V2 span-labeling rule matched.".to_string(),
+        ),
+        (None, _) => return None,
+    };
+
+    Some(SpanLabel {
+        image_id: span.image_id.clone(),
+        bbox: span.bbox.clone(),
+        label,
+        confidence: confidence.clamp(0.0, 1.0),
+        reason,
+    })
+}
+
+fn classify_span(
+    expected: &ExpectedFields,
+    span: &TextSpan,
+    norm: &str,
+) -> Option<(SpanLabelKind, f32, String)> {
+    let text = span.text.as_str();
+    let base_confidence = span.confidence.unwrap_or(65.0) / 100.0;
+
+    if norm.contains("government") || norm.contains("warning") {
+        return Some((
+            SpanLabelKind::GovernmentWarning,
+            base_confidence.max(0.9),
+            "Matched government-warning heading token.".to_string(),
+        ));
+    }
+
+    if !extract_abv_candidates(text).is_empty() || !extract_proof_candidates(text).is_empty() {
+        return Some((
+            SpanLabelKind::AlcoholContent,
+            base_confidence.max(0.88),
+            "Matched ABV/proof pattern.".to_string(),
+        ));
+    }
+
+    if !extract_net_contents_candidates(text).is_empty() {
+        return Some((
+            SpanLabelKind::NetContents,
+            base_confidence.max(0.86),
+            "Matched net-contents pattern.".to_string(),
+        ));
+    }
+
+    if detect_observed_class(text).is_some() {
+        return Some((
+            SpanLabelKind::ClassType,
+            base_confidence.max(0.82),
+            "Matched curated alcohol class taxonomy.".to_string(),
+        ));
+    }
+
+    if span_is_country_candidate(text, norm) {
+        return Some((
+            SpanLabelKind::Country,
+            base_confidence.max(0.82),
+            "Matched country alias or US city/state inference.".to_string(),
+        ));
+    }
+
+    if expected
+        .brand_name
+        .as_deref()
+        .is_some_and(|brand| similarity(brand, text) >= 0.72 || token_overlap(brand, text) >= 0.72)
+    {
+        return Some((
+            SpanLabelKind::BrandName,
+            base_confidence.max(0.78),
+            "Matched expected brand with fuzzy text features.".to_string(),
+        ));
+    }
+
+    if expected.bottler.as_deref().is_some_and(|bottler| {
+        similarity(bottler, text) >= 0.72 || token_overlap(bottler, text) >= 0.72
+    }) {
+        return Some((
+            SpanLabelKind::Bottler,
+            base_confidence.max(0.76),
+            "Matched expected bottler with fuzzy text features.".to_string(),
+        ));
+    }
+
+    None
+}
+
+fn span_is_country_candidate(text: &str, norm: &str) -> bool {
+    COUNTRY_ALIASES.iter().any(|country| {
+        country
+            .aliases
+            .iter()
+            .any(|alias| contains_word_phrase(norm, &normalize_text(alias)))
+    }) || US_STATE_CODES
+        .iter()
+        .any(|state| text.trim().eq_ignore_ascii_case(state))
+}
+
 fn aggregate_verdict(
     fields: &BTreeMap<String, FieldCheck>,
     warning_status: &CheckStatus,
@@ -947,6 +1335,55 @@ fn aggregate_verdict(
     Verdict::Pass
 }
 
+fn processing_path(
+    warning_status: &CheckStatus,
+    ocr_passes: &[OcrPassReport],
+    budget_exhausted: bool,
+) -> ProcessingPath {
+    if budget_exhausted {
+        return ProcessingPath::TimeoutReview;
+    }
+    if ocr_passes.len() > 1 {
+        return ProcessingPath::EnhancedRetry;
+    }
+    if matches!(warning_status, CheckStatus::Review) {
+        return ProcessingPath::CheapRepair;
+    }
+    ProcessingPath::FastPass
+}
+
+fn escalation_reason(
+    warning_status: &CheckStatus,
+    ocr_passes: &[OcrPassReport],
+    budget_exhausted: bool,
+) -> Option<String> {
+    if budget_exhausted {
+        return Some("per_image_budget_exhausted".to_string());
+    }
+    if ocr_passes.len() > 1 {
+        return Some("ocr_quality_gate_triggered_retry".to_string());
+    }
+    if matches!(warning_status, CheckStatus::Review) {
+        return Some("warning_heading_repaired_from_ocr_noise".to_string());
+    }
+    None
+}
+
+fn record_stage(stage_timings: &mut Vec<StageTiming>, stage: impl Into<String>, started: Instant) {
+    stage_timings.push(StageTiming {
+        stage: stage.into(),
+        elapsed_ms: started.elapsed().as_millis(),
+    });
+}
+
+fn image_time_budget_ms() -> u128 {
+    std::env::var("TTB_IMAGE_TIME_BUDGET_MS")
+        .ok()
+        .and_then(|value| value.parse::<u128>().ok())
+        .filter(|value| *value >= 500)
+        .unwrap_or(4500)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -954,6 +1391,7 @@ mod tests {
     use crate::ocr::OcrEngine;
     use crate::warning::CANONICAL_WARNING;
     use anyhow::Result;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn field_matching_tolerates_minor_brand_noise() {
@@ -1131,6 +1569,74 @@ mod tests {
     }
 
     #[test]
+    fn noisy_warning_uses_cheap_repair_path() {
+        let warning = check_government_warning("GOVERNMENT WARK: OCR noise", &[]);
+        let path = processing_path(&warning.status, &[], false);
+        assert_eq!(warning.status, CheckStatus::Review);
+        assert_eq!(path, ProcessingPath::CheapRepair);
+        assert_eq!(
+            escalation_reason(&warning.status, &[], false).as_deref(),
+            Some("warning_heading_repaired_from_ocr_noise")
+        );
+    }
+
+    #[test]
+    fn candidate_span_labeling_is_bounded_and_fast() {
+        let spans = (0..120)
+            .map(|index| TextSpan {
+                image_id: "img".to_string(),
+                source_engine: "mock".to_string(),
+                text: if index == 10 {
+                    "GOVERNMENT WARK".to_string()
+                } else if index == 20 {
+                    "12% ALC/VOL".to_string()
+                } else if index == 30 {
+                    "750 ML".to_string()
+                } else {
+                    format!("unrelated noisy span {index}")
+                },
+                confidence: Some(65.0),
+                bbox: None,
+            })
+            .collect::<Vec<_>>();
+        let expected = ExpectedFields {
+            brand_name: Some("Honey Liqueur".to_string()),
+            class_type: Some("Liqueur".to_string()),
+            alcohol_content: Some("12%".to_string()),
+            net_contents: Some("750 ml".to_string()),
+            bottler: None,
+            country: None,
+        };
+
+        let started = Instant::now();
+        let labels = label_spans_with_mode(&expected, &spans, SpanLabelMode::Candidate);
+        let elapsed = started.elapsed();
+
+        assert!(elapsed.as_millis() < 250);
+        assert!(labels.len() <= 64);
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.label == SpanLabelKind::GovernmentWarning)
+        );
+        assert!(
+            labels
+                .iter()
+                .all(|label| label.label != SpanLabelKind::Other)
+        );
+    }
+
+    #[test]
+    fn timeout_budget_sets_timeout_path() {
+        let path = processing_path(&CheckStatus::Pass, &[], true);
+        assert_eq!(path, ProcessingPath::TimeoutReview);
+        assert_eq!(
+            escalation_reason(&CheckStatus::Pass, &[], true).as_deref(),
+            Some("per_image_budget_exhausted")
+        );
+    }
+
+    #[test]
     fn aggregate_warns_when_expected_data_missing() {
         let fields = verify_fields(&ExpectedFields::default(), "", &[]);
         assert_eq!(fields["brand_name"].status, CheckStatus::Review);
@@ -1157,6 +1663,16 @@ mod tests {
                 engine: self.name().to_string(),
                 raw_text,
                 spans: Vec::new(),
+                passes: vec![OcrPassReport {
+                    image_id: image.image_id.clone(),
+                    profile: "mock".to_string(),
+                    rotation_degrees: 0,
+                    elapsed_ms: 1,
+                    span_count: 0,
+                    mean_confidence: None,
+                    warning_heading_detected: true,
+                    error: None,
+                }],
                 warnings: Vec::new(),
                 elapsed_ms: 1,
             })
@@ -1178,6 +1694,63 @@ mod tests {
 
         async fn read(&self, _image: &ImagePayload) -> Result<OcrOutput> {
             anyhow::bail!("simulated OCR failure")
+        }
+    }
+
+    #[derive(Debug)]
+    struct EnhancedRetryEngine {
+        enhanced_calls: AtomicUsize,
+    }
+
+    impl EnhancedRetryEngine {
+        fn output(&self, image: &ImagePayload, raw_text: &str, profile: &str) -> OcrOutput {
+            OcrOutput {
+                image_id: image.image_id.clone(),
+                filename: image.filename.clone(),
+                engine: self.name().to_string(),
+                raw_text: raw_text.to_string(),
+                spans: Vec::new(),
+                passes: vec![OcrPassReport {
+                    image_id: image.image_id.clone(),
+                    profile: profile.to_string(),
+                    rotation_degrees: 0,
+                    elapsed_ms: 1,
+                    span_count: 8,
+                    mean_confidence: Some(90.0),
+                    warning_heading_detected: raw_text.contains("GOVERNMENT WARNING"),
+                    error: None,
+                }],
+                warnings: Vec::new(),
+                elapsed_ms: 1,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OcrEngine for EnhancedRetryEngine {
+        fn name(&self) -> &'static str {
+            "enhanced-retry-mock"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn read(&self, image: &ImagePayload) -> Result<OcrOutput> {
+            Ok(self.output(
+                image,
+                "Blue Heron Silver Tequila 40% Alc./Vol. (80 Proof) 750 mL",
+                "mock",
+            ))
+        }
+
+        async fn read_enhanced_retry(&self, image: &ImagePayload) -> Result<OcrOutput> {
+            self.enhanced_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.output(
+                image,
+                "Blue Heron Silver Tequila 40% Alc./Vol. (80 Proof) 750 mL GOVERNMENT WARNING: drinking can cause health problems",
+                "enhanced_mock",
+            ))
         }
     }
 
@@ -1265,6 +1838,42 @@ CEDAR KNOLLS, NJ STILL WHITE WINE"#;
         assert_eq!(result.fields["country"].status, CheckStatus::Pass);
         assert_eq!(result.government_warning.status, CheckStatus::Pass);
         assert_eq!(result.verdict, Verdict::Pass);
+    }
+
+    #[tokio::test]
+    async fn first_pass_fail_runs_enhanced_retry_before_final_verdict() {
+        let engine = EnhancedRetryEngine {
+            enhanced_calls: AtomicUsize::new(0),
+        };
+        let product = ProductInput {
+            product_id: "blue-heron".to_string(),
+            label: Some("Blue Heron".to_string()),
+            expected: ExpectedFields {
+                brand_name: Some("Blue Heron".to_string()),
+                class_type: Some("Silver Tequila".to_string()),
+                alcohol_content: Some("80 Proof".to_string()),
+                net_contents: Some("750 mL".to_string()),
+                bottler: None,
+                country: None,
+            },
+            images: vec![ImagePayload {
+                image_id: "front".to_string(),
+                filename: "front.txt".to_string(),
+                content_type: Some("text/plain".to_string()),
+                bytes: Vec::new(),
+            }],
+        };
+
+        let result = verify_product(&engine, product).await;
+
+        assert_eq!(engine.enhanced_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.verdict, Verdict::Pass);
+        assert_eq!(result.processing_path, ProcessingPath::EnhancedRetry);
+        assert_eq!(
+            result.escalation_reason.as_deref(),
+            Some("first_pass_failure_triggered_enhanced_retry")
+        );
+        assert_eq!(result.government_warning.status, CheckStatus::Pass);
     }
 
     #[tokio::test]

@@ -13,3 +13,6 @@ Recommended quick test labels:
 - failure image with `Government Warning` in title case
 - failure image with the warning omitted
 
+Generated offline test labels are in `samples/generated-labels`. That pack includes
+compliant labels, warning failures, field mismatch failures, a sideways warning
+case, and CSV/JSON manifests for batch upload testing.

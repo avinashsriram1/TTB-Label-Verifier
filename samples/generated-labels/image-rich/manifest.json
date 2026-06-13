@@ -1,0 +1,82 @@
+﻿{
+    "products":  [
+                     {
+                         "product_id":  "img-rose-pass",
+                         "label":  "img-rose-pass",
+                         "image":  "11_compliant_illustrated_rose_wine.png",
+                         "brand_name":  "Lenz Hill",
+                         "class_type":  "Still Rose Wine",
+                         "alcohol_content":  "12% Alc./Vol.",
+                         "net_contents":  "750 mL",
+                         "bottler":  "Cedar Knolls Wine Co.",
+                         "country":  "Austria",
+                         "expected_verdict":  "pass",
+                         "notes":  "Image-rich rose wine with dark panel and grape illustration"
+                     },
+                     {
+                         "product_id":  "img-honey-pass",
+                         "label":  "img-honey-pass",
+                         "image":  "12_compliant_illustrated_honey_liqueur.png",
+                         "brand_name":  "Black Bear",
+                         "class_type":  "Honey Liqueur",
+                         "alcohol_content":  "35% Alc./Vol. (70 Proof)",
+                         "net_contents":  "50 mL",
+                         "bottler":  "Golden Hive Imports",
+                         "country":  "Germany",
+                         "expected_verdict":  "pass",
+                         "notes":  "Image-rich honey liqueur with bear and honeycomb artwork"
+                     },
+                     {
+                         "product_id":  "img-pomegranate-pass",
+                         "label":  "img-pomegranate-pass",
+                         "image":  "13_compliant_illustrated_pomegranate_liqueur.png",
+                         "brand_name":  "Ecstasy",
+                         "class_type":  "Liqueur",
+                         "alcohol_content":  "35%",
+                         "net_contents":  "750 mL",
+                         "bottler":  "Distilled Resources",
+                         "country":  "United States",
+                         "expected_verdict":  "pass_or_review",
+                         "notes":  "Low contrast decorative artwork similar to tall red liqueur labels"
+                     },
+                     {
+                         "product_id":  "img-missing-warning-fail",
+                         "label":  "img-missing-warning-fail",
+                         "image":  "14_noncompliant_illustrated_missing_warning.png",
+                         "brand_name":  "Desert Star",
+                         "class_type":  "Silver Tequila",
+                         "alcohol_content":  "40% Alc./Vol. (80 Proof)",
+                         "net_contents":  "750 mL",
+                         "bottler":  "Desert Star Imports",
+                         "country":  "Mexico",
+                         "expected_verdict":  "fail",
+                         "notes":  "Image-rich agave label missing government warning"
+                     },
+                     {
+                         "product_id":  "img-titlecase-warning-fail",
+                         "label":  "img-titlecase-warning-fail",
+                         "image":  "15_noncompliant_illustrated_titlecase_warning.png",
+                         "brand_name":  "Oak \u0026 River",
+                         "class_type":  "Straight Rye Whiskey",
+                         "alcohol_content":  "50% Alc./Vol. (100 Proof)",
+                         "net_contents":  "750 mL",
+                         "bottler":  "Oak \u0026 River Distilling Co.",
+                         "country":  "United States",
+                         "expected_verdict":  "fail",
+                         "notes":  "Image-rich whiskey label with title-case warning heading"
+                     },
+                     {
+                         "product_id":  "img-side-panel-cider-review",
+                         "label":  "img-side-panel-cider-review",
+                         "image":  "16_review_illustrated_side_panel_cider.png",
+                         "brand_name":  "North Orchard",
+                         "class_type":  "Hard Cider",
+                         "alcohol_content":  "6.2% Alc./Vol.",
+                         "net_contents":  "355 mL",
+                         "bottler":  "North Orchard Cidery",
+                         "country":  "United States",
+                         "expected_verdict":  "pass_or_review",
+                         "notes":  "Image-rich cider label with warning rotated in a side panel"
+                     }
+                 ]
+}
