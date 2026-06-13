@@ -13,7 +13,6 @@ pub struct ManifestProduct {
 
 pub fn parse_manifest(filename: Option<&str>, bytes: &[u8]) -> Result<Vec<ManifestProduct>> {
     let text = std::str::from_utf8(bytes).context("manifest must be UTF-8")?;
-    let text = text.trim_start_matches('\u{feff}');
     let trimmed = text.trim_start();
     let looks_json = filename.is_some_and(|name| name.to_lowercase().ends_with(".json"))
         || trimmed.starts_with('[')
@@ -45,8 +44,7 @@ fn parse_json_manifest(text: &str) -> Result<Vec<ManifestProduct>> {
                 .as_object()
                 .ok_or_else(|| anyhow!("manifest product at index {idx} is not an object"))?;
             let map = normalize_json_object(object);
-            let images = image_names_from_json_object(object)
-                .or_else(|| image_names_from_map(&map))
+            let images = image_names_from_map(&map)
                 .ok_or_else(|| anyhow!("manifest product at index {idx} is missing images"))?;
             let product_id = get_alias(&map, &["productid", "product", "ttbid", "id"])
                 .unwrap_or_else(|| {
@@ -117,11 +115,7 @@ fn normalize_json_object(object: &serde_json::Map<String, Value>) -> HashMap<Str
             Value::Array(items) => {
                 let joined = items
                     .iter()
-                    .filter_map(|item| {
-                        item.as_str()
-                            .map(ToOwned::to_owned)
-                            .or_else(|| image_name_from_json_value(item))
-                    })
+                    .filter_map(|item| item.as_str())
                     .collect::<Vec<_>>()
                     .join("|");
                 out.insert(key, joined);
@@ -133,20 +127,7 @@ fn normalize_json_object(object: &serde_json::Map<String, Value>) -> HashMap<Str
 }
 
 fn image_names_from_map(map: &HashMap<String, String>) -> Option<Vec<String>> {
-    get_alias(
-        map,
-        &[
-            "images",
-            "image",
-            "filename",
-            "file",
-            "files",
-            "imagenames",
-            "frontimage",
-            "backimage",
-        ],
-    )
-    .map(|value| {
+    get_alias(map, &["images", "image", "filename", "file"]).map(|value| {
         value
             .split(['|', ',', ';'])
             .map(str::trim)
@@ -154,71 +135,6 @@ fn image_names_from_map(map: &HashMap<String, String>) -> Option<Vec<String>> {
             .map(ToOwned::to_owned)
             .collect::<Vec<_>>()
     })
-}
-
-fn image_names_from_json_object(object: &serde_json::Map<String, Value>) -> Option<Vec<String>> {
-    let mut names = Vec::new();
-    for alias in [
-        "images",
-        "image",
-        "filename",
-        "file",
-        "files",
-        "image_names",
-        "imageNames",
-        "front_image",
-        "frontImage",
-        "back_image",
-        "backImage",
-    ] {
-        if let Some(value) = object.get(alias) {
-            collect_image_names(value, &mut names);
-        }
-    }
-
-    if names.is_empty() { None } else { Some(names) }
-}
-
-fn collect_image_names(value: &Value, names: &mut Vec<String>) {
-    match value {
-        Value::String(text) => {
-            names.extend(
-                text.split(['|', ',', ';'])
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(ToOwned::to_owned),
-            );
-        }
-        Value::Array(items) => {
-            for item in items {
-                collect_image_names(item, names);
-            }
-        }
-        Value::Object(_) => {
-            if let Some(name) = image_name_from_json_value(value) {
-                names.push(name);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn image_name_from_json_value(value: &Value) -> Option<String> {
-    let object = value.as_object()?;
-    [
-        "image",
-        "filename",
-        "file",
-        "path",
-        "name",
-        "front_image",
-        "back_image",
-    ]
-    .iter()
-    .find_map(|key| object.get(*key).and_then(Value::as_str))
-    .map(str::trim)
-    .filter(|value| !value.is_empty())
-    .map(ToOwned::to_owned)
 }
 
 fn expected_from_map(map: &HashMap<String, String>) -> ExpectedFields {
@@ -267,49 +183,5 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].image_names, vec!["front.jpg", "back.jpg"]);
         assert_eq!(parsed[0].expected.alcohol_content.as_deref(), Some("45%"));
-    }
-
-    #[test]
-    fn parses_json_products_object_with_image_aliases_and_metadata() {
-        let json = r#"{
-            "products": [{
-                "product_id": "hard-one",
-                "image_names": ["folder/front.png", {"filename": "back.png"}],
-                "brand_name": "Night Orchard",
-                "expected_verdict": "pass_or_review",
-                "expected_path": "enhanced_retry",
-                "notes": "human-only metadata"
-            }]
-        }"#;
-        let parsed = parse_manifest(Some("manifest.json"), json.as_bytes()).unwrap();
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].product_id, "hard-one");
-        assert_eq!(parsed[0].image_names, vec!["folder/front.png", "back.png"]);
-        assert_eq!(
-            parsed[0].expected.brand_name.as_deref(),
-            Some("Night Orchard")
-        );
-    }
-
-    #[test]
-    fn parses_json_front_and_back_image_fields() {
-        let json = r#"[{
-            "id": "multi",
-            "front_image": "front.jpg",
-            "back_image": {"file": "back.jpg"},
-            "class_type": "Red Wine"
-        }]"#;
-        let parsed = parse_manifest(Some("manifest.json"), json.as_bytes()).unwrap();
-        assert_eq!(parsed[0].image_names, vec!["front.jpg", "back.jpg"]);
-        assert_eq!(parsed[0].expected.class_type.as_deref(), Some("Red Wine"));
-    }
-
-    #[test]
-    fn parses_json_manifest_with_utf8_bom() {
-        let json =
-            "\u{feff}{\"products\":[{\"id\":\"bom\",\"image\":\"front.png\",\"brand\":\"Brand\"}]}";
-        let parsed = parse_manifest(Some("manifest.json"), json.as_bytes()).unwrap();
-        assert_eq!(parsed[0].product_id, "bom");
-        assert_eq!(parsed[0].image_names, vec!["front.png"]);
     }
 }

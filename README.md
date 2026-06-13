@@ -202,16 +202,6 @@ known test labels exposed four priorities:
 - Ecstasy: observed values must never expose raw OCR text, even when a fuzzy match
   succeeds.
 
-This branch implements the first V2 increment:
-
-- OCR pass telemetry for preprocessing and rotation retries.
-- Local contrast and threshold preprocessing before selected OCR retries.
-- A heuristic span-labeling baseline for future learned extraction.
-- Adaptive fast-first processing with a default 4.5 second per-image budget.
-- Review queue filters by verdict and fail/review reason.
-- Structured correction capture with no raw image or raw OCR storage.
-- API-level redaction for raw OCR, span text, and warning found text.
-
 ### Image Robustness
 
 - Add local preprocessing profiles before OCR: contrast normalization, grayscale,
@@ -268,26 +258,6 @@ This branch implements the first V2 increment:
 - Add a deployment flag to hide raw OCR debug output entirely in production.
 - Expand batch review filters by fail reason, warning status, class mismatch, country
   mismatch, and low confidence.
-
-Runtime flags:
-
-- `TTB_SHOW_RAW_OCR=true` exposes raw OCR in API/UI debug output for local debugging.
-  The default is `false`.
-- `TTB_PROCESSING_PROFILE=adaptive|fast|enhanced` controls the fast-first policy.
-  The default is `adaptive`. Use `fast` for a V1-style primary OCR pass only, and
-  `enhanced` only for manual hard-label experiments.
-- `TTB_IMAGE_TIME_BUDGET_MS=4500` caps the per-image work budget. If processing
-  exhausts the budget, the result is routed to review rather than continuing.
-- `TTB_BATCH_PARALLELISM=2` controls how many products are processed in parallel.
-  Keeping this bounded prevents batch jobs from saturating CPU with Tesseract.
-- `TTB_MAX_IMAGE_LONG_EDGE=1800` resizes oversized uploads before OCR.
-- `TTB_SPAN_LABEL_MODE=off|candidate|full` controls span labeling. The default
-  `candidate` mode labels useful spans only and avoids expensive full-transcript
-  labeling.
-- `TTB_OCR_RETRY_MODE=fast|balanced|enhanced` is still accepted for compatibility,
-  but `TTB_PROCESSING_PROFILE` is preferred.
-- `TTB_CORRECTIONS_PATH=./tmp/corrections.ndjson` appends structured correction
-  records to newline-delimited JSON. If unset, corrections stay in memory only.
 
 ## Assumptions
 

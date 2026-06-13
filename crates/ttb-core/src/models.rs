@@ -62,64 +62,14 @@ pub struct TextSpan {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OcrPassReport {
-    pub image_id: String,
-    pub profile: String,
-    pub rotation_degrees: u16,
-    pub elapsed_ms: u128,
-    pub span_count: usize,
-    pub mean_confidence: Option<f32>,
-    pub warning_heading_detected: bool,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OcrOutput {
     pub image_id: String,
     pub filename: String,
     pub engine: String,
     pub raw_text: String,
     pub spans: Vec<TextSpan>,
-    pub passes: Vec<OcrPassReport>,
     pub warnings: Vec<String>,
     pub elapsed_ms: u128,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ProcessingPath {
-    FastPass,
-    CheapRepair,
-    EnhancedRetry,
-    TimeoutReview,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StageTiming {
-    pub stage: String,
-    pub elapsed_ms: u128,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SpanLabelKind {
-    BrandName,
-    ClassType,
-    AlcoholContent,
-    NetContents,
-    GovernmentWarning,
-    Bottler,
-    Country,
-    Other,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpanLabel {
-    pub image_id: String,
-    pub bbox: Option<BoundingBox>,
-    pub label: SpanLabelKind,
-    pub confidence: f32,
-    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,13 +105,6 @@ pub struct VerificationResult {
     pub government_warning: WarningCheck,
     pub raw_text: String,
     pub spans: Vec<TextSpan>,
-    pub span_labels: Vec<SpanLabel>,
-    pub ocr_passes: Vec<OcrPassReport>,
-    pub processing_path: ProcessingPath,
-    pub stage_timings: Vec<StageTiming>,
-    pub budget_ms: u128,
-    pub budget_exhausted: bool,
-    pub escalation_reason: Option<String>,
     pub engines: Vec<String>,
     pub image_count: usize,
     pub latency_ms: u128,
