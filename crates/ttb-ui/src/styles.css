@@ -206,7 +206,9 @@ select {
 }
 
 .primary,
-.export {
+.export,
+.secondary,
+.danger {
   border: 0;
   border-radius: 8px;
   background: var(--accent);
@@ -226,6 +228,39 @@ select {
   background: var(--accent-strong);
 }
 
+.primary.compact,
+.secondary,
+.danger {
+  min-height: 44px;
+  padding: 10px 14px;
+  font-size: 15px;
+  box-shadow: none;
+}
+
+.secondary {
+  background: #eef6fb;
+  color: #244858;
+  border: 1px solid var(--line);
+}
+
+.secondary:hover {
+  background: #dfeef5;
+}
+
+.secondary.small {
+  min-height: 38px;
+  padding: 8px 12px;
+}
+
+.danger {
+  background: var(--fail);
+  color: #ffffff;
+}
+
+.danger:hover {
+  background: #8f1b12;
+}
+
 .help {
   display: inline-grid;
   place-items: center;
@@ -236,7 +271,32 @@ select {
   background: #ffda78;
   color: #533b00;
   font-weight: 900;
-  cursor: help;
+  cursor: pointer;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgb(12 30 38 / 54%);
+}
+
+.help-dialog {
+  width: min(560px, 100%);
+  padding: 22px;
+  border-radius: 8px;
+  background: #ffffff;
+  border: 1px solid var(--line);
+  box-shadow: 0 24px 70px rgb(7 27 35 / 35%);
+}
+
+.help-dialog p {
+  color: #314455;
+  font-size: 17px;
+  line-height: 1.55;
 }
 
 .chip,
@@ -262,6 +322,19 @@ select {
 .timer {
   background: #e8f1ff;
   color: #1451a3;
+}
+
+.details-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: #eef6fb;
+  color: #244858;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
 }
 
 .verdict.pass,
@@ -371,6 +444,75 @@ th {
   margin: 14px 0;
 }
 
+.batch-tools {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 14px 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f8fbfd;
+}
+
+.batch-tools label {
+  min-width: 190px;
+}
+
+.batch-result {
+  padding: 0;
+  overflow: hidden;
+}
+
+.batch-result summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 16px 18px;
+  list-style: none;
+}
+
+.batch-result summary::-webkit-details-marker {
+  display: none;
+}
+
+.batch-result summary::before {
+  content: ">";
+  color: var(--muted);
+  font-weight: 900;
+}
+
+.batch-result[open] summary::before {
+  content: "v";
+}
+
+.batch-result summary > span:first-child {
+  display: grid;
+  gap: 3px;
+}
+
+.batch-result small {
+  color: var(--muted);
+  font-weight: 650;
+}
+
+.batch-result > table,
+.batch-result > .warning,
+.batch-result > .debug,
+.batch-result > .note {
+  margin-left: 18px;
+  margin-right: 18px;
+}
+
+.batch-result > .note:last-child,
+.batch-result > .debug:last-child,
+.batch-result > .warning:last-child {
+  margin-bottom: 18px;
+}
+
 .review-tools {
   display: flex;
   align-items: end;
@@ -431,10 +573,8 @@ summary {
   font-weight: 700;
 }
 
-.correction-form {
+.review-editor {
   display: grid;
-  grid-template-columns: auto minmax(170px, 220px) minmax(220px, 1fr) auto;
-  align-items: center;
   gap: 10px;
   margin-top: 14px;
   padding: 12px;
@@ -443,24 +583,38 @@ summary {
   background: #f2fff6;
 }
 
-.correction-form strong {
+.review-editor-head,
+.review-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.review-editor strong {
   color: var(--pass);
 }
 
-.correction-form input,
-.correction-form select {
+.review-editor input {
   min-height: 42px;
 }
 
-.correction-form button {
-  border: 0;
-  border-radius: 8px;
-  background: var(--pass);
-  color: #ffffff;
-  min-height: 42px;
-  padding: 10px 14px;
+.unsaved {
+  display: inline-flex;
+  min-height: 26px;
+  align-items: center;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: var(--review-bg);
+  color: var(--review);
   font-weight: 800;
-  cursor: pointer;
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+[hidden] {
+  display: none !important;
 }
 
 pre {
@@ -520,8 +674,15 @@ pre {
   }
 
   .review-tools,
-  .correction-form {
+  .review-editor,
+  .batch-tools,
+  .review-actions,
+  .review-editor-head {
     display: grid;
     grid-template-columns: 1fr;
+  }
+
+  .batch-result summary {
+    display: grid;
   }
 }

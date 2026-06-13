@@ -18,8 +18,8 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use ttb_core::{
-    ExpectedFields, ImagePayload, ManifestProduct, OcrEngine, ProductInput, TesseractCliEngine,
-    Verdict, VerificationResult, parse_manifest, verify_product,
+    CheckStatus, ExpectedFields, ImagePayload, ManifestProduct, OcrEngine, ProductInput,
+    TesseractCliEngine, Verdict, VerificationResult, parse_manifest, verify_product,
 };
 use uuid::Uuid;
 
@@ -517,6 +517,7 @@ async fn process_batch_job(state: Arc<AppState>, job_id: Uuid, products: Vec<Pro
     for handle in handles {
         match handle.await {
             Ok(result) => {
+                let result = apply_batch_verdict_policy(result);
                 let result = sanitize_result_for_response(result, &state.config);
                 let mut jobs = state.jobs.write().await;
                 if let Some(job) = jobs.get_mut(&job_id) {
@@ -547,6 +548,65 @@ async fn process_batch_job(state: Arc<AppState>, job_id: Uuid, products: Vec<Pro
             JobStatus::Failed
         };
     }
+}
+
+fn apply_batch_verdict_policy(mut result: VerificationResult) -> VerificationResult {
+    let mut demoted = Vec::new();
+
+    for field_name in ["country", "bottler"] {
+        let Some(field) = result.fields.get_mut(field_name) else {
+            continue;
+        };
+        let expected_present = field
+            .expected
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+        let could_not_observe = field.observed.is_none()
+            && matches!(field.status, CheckStatus::Fail | CheckStatus::Missing);
+
+        if expected_present && could_not_observe {
+            field.status = CheckStatus::Review;
+            field.detail = format!(
+                "{} Batch review required because OCR could not confidently observe this optional field.",
+                field.detail
+            );
+            demoted.push(field_name);
+        }
+    }
+
+    if !demoted.is_empty() {
+        result.notes.push(format!(
+            "Batch policy routed missing optional field evidence to review: {}.",
+            demoted.join(", ")
+        ));
+        result.verdict = aggregate_response_verdict(&result);
+    }
+
+    result
+}
+
+fn aggregate_response_verdict(result: &VerificationResult) -> Verdict {
+    if matches!(
+        result.government_warning.status,
+        CheckStatus::Fail | CheckStatus::Missing
+    ) || result
+        .fields
+        .values()
+        .any(|field| matches!(field.status, CheckStatus::Fail))
+    {
+        return Verdict::Fail;
+    }
+
+    if matches!(result.government_warning.status, CheckStatus::Review)
+        || result
+            .fields
+            .values()
+            .any(|field| matches!(field.status, CheckStatus::Review | CheckStatus::Missing))
+    {
+        return Verdict::Review;
+    }
+
+    Verdict::Pass
 }
 
 async fn append_correction_record(path: &PathBuf, record: &CorrectionRecord) -> Result<()> {
@@ -757,6 +817,124 @@ mod tests {
             Some("GOVERNMENT WARNING raw body")
         );
     }
+
+    #[test]
+    fn batch_policy_demotes_missing_optional_country_to_review() {
+        let mut result = result_with_raw_ocr();
+        result.verdict = Verdict::Fail;
+        result.fields.insert(
+            "country".to_string(),
+            FieldCheck {
+                field: "country".to_string(),
+                expected: Some("United States".to_string()),
+                observed: None,
+                status: CheckStatus::Fail,
+                confidence: 0.0,
+                detail: "Country of origin was not found with enough confidence.".to_string(),
+                evidence: Vec::new(),
+            },
+        );
+
+        let result = apply_batch_verdict_policy(result);
+        assert_eq!(result.fields["country"].status, CheckStatus::Review);
+        assert_eq!(result.verdict, Verdict::Review);
+    }
+
+    #[test]
+    fn batch_policy_keeps_conflicting_country_as_fail() {
+        let mut result = result_with_raw_ocr();
+        result.verdict = Verdict::Fail;
+        result.fields.insert(
+            "country".to_string(),
+            FieldCheck {
+                field: "country".to_string(),
+                expected: Some("United States".to_string()),
+                observed: Some("Austria".to_string()),
+                status: CheckStatus::Fail,
+                confidence: 0.1,
+                detail: "Country of origin conflicts with the application data.".to_string(),
+                evidence: Vec::new(),
+            },
+        );
+
+        let result = apply_batch_verdict_policy(result);
+        assert_eq!(result.fields["country"].status, CheckStatus::Fail);
+        assert_eq!(result.verdict, Verdict::Fail);
+    }
+
+    #[test]
+    fn batch_policy_keeps_government_warning_fail() {
+        let mut result = result_with_raw_ocr();
+        result.verdict = Verdict::Fail;
+        result.government_warning.status = CheckStatus::Fail;
+        result.fields.insert(
+            "bottler".to_string(),
+            FieldCheck {
+                field: "bottler".to_string(),
+                expected: Some("Blue Heron Imports".to_string()),
+                observed: None,
+                status: CheckStatus::Fail,
+                confidence: 0.0,
+                detail: "Bottler/producer was not found with enough confidence.".to_string(),
+                evidence: Vec::new(),
+            },
+        );
+
+        let result = apply_batch_verdict_policy(result);
+        assert_eq!(result.fields["bottler"].status, CheckStatus::Review);
+        assert_eq!(result.verdict, Verdict::Fail);
+    }
+
+    #[test]
+    fn batch_manifest_matches_uploaded_basename_from_json_path() {
+        let form = MultipartForm {
+            fields: BTreeMap::new(),
+            images: vec![ImagePayload {
+                image_id: "img".to_string(),
+                filename: "front.png".to_string(),
+                content_type: None,
+                bytes: Vec::new(),
+            }],
+            manifest: Some((
+                Some("manifest.json".to_string()),
+                br#"{"products":[{"id":"p1","image":"folder/front.png","brand":"Brand"}]}"#
+                    .to_vec(),
+            )),
+        };
+
+        let products = build_batch_products(form).unwrap();
+        assert_eq!(products.len(), 1);
+        assert_eq!(products[0].product_id, "p1");
+        assert_eq!(products[0].images[0].filename, "front.png");
+    }
+
+    #[test]
+    fn batch_manifest_reports_ambiguous_basename() {
+        let form = MultipartForm {
+            fields: BTreeMap::new(),
+            images: vec![
+                ImagePayload {
+                    image_id: "one".to_string(),
+                    filename: "front.png".to_string(),
+                    content_type: None,
+                    bytes: Vec::new(),
+                },
+                ImagePayload {
+                    image_id: "two".to_string(),
+                    filename: "nested/front.png".to_string(),
+                    content_type: None,
+                    bytes: Vec::new(),
+                },
+            ],
+            manifest: Some((
+                Some("manifest.json".to_string()),
+                br#"{"products":[{"id":"p1","image":"folder/front.png"}]}"#.to_vec(),
+            )),
+        };
+
+        let err = build_batch_products(form).unwrap_err().to_string();
+        assert!(err.contains("ambiguous"));
+    }
 }
 
 struct MultipartForm {
@@ -829,15 +1007,11 @@ fn expected_from_fields(fields: &BTreeMap<String, String>) -> ExpectedFields {
 }
 
 fn build_batch_products(form: MultipartForm) -> Result<Vec<ProductInput>> {
-    let image_map = form
-        .images
-        .into_iter()
-        .map(|image| (image.filename.clone(), image))
-        .collect::<HashMap<_, _>>();
+    let image_lookup = UploadedImages::new(form.images)?;
 
     let Some((manifest_name, manifest_bytes)) = form.manifest else {
-        return Ok(image_map
-            .into_values()
+        return Ok(image_lookup
+            .into_remaining()
             .map(|image| ProductInput {
                 product_id: image.filename.clone(),
                 label: Some(image.filename.clone()),
@@ -848,22 +1022,19 @@ fn build_batch_products(form: MultipartForm) -> Result<Vec<ProductInput>> {
     };
 
     let manifest = parse_manifest(manifest_name.as_deref(), &manifest_bytes)?;
-    products_from_manifest(manifest, image_map)
+    products_from_manifest(manifest, image_lookup)
 }
 
 fn products_from_manifest(
     manifest: Vec<ManifestProduct>,
-    mut image_map: HashMap<String, ImagePayload>,
+    mut image_lookup: UploadedImages,
 ) -> Result<Vec<ProductInput>> {
     let mut products = Vec::new();
 
     for item in manifest {
         let mut images = Vec::new();
         for image_name in item.image_names {
-            let image = image_map
-                .remove(&image_name)
-                .ok_or_else(|| anyhow::anyhow!("manifest references missing image {image_name}"))?;
-            images.push(image);
+            images.push(image_lookup.take(&image_name)?);
         }
 
         if images.len() > MAX_IMAGES_PER_PRODUCT {
@@ -883,7 +1054,7 @@ fn products_from_manifest(
         });
     }
 
-    for image in image_map.into_values() {
+    for image in image_lookup.into_remaining() {
         products.push(ProductInput {
             product_id: image.filename.clone(),
             label: Some(image.filename.clone()),
@@ -893,4 +1064,76 @@ fn products_from_manifest(
     }
 
     Ok(products)
+}
+
+struct UploadedImages {
+    images: Vec<Option<ImagePayload>>,
+    keys: HashMap<String, Vec<usize>>,
+}
+
+impl UploadedImages {
+    fn new(images: Vec<ImagePayload>) -> Result<Self> {
+        let mut lookup = Self {
+            images: images.into_iter().map(Some).collect(),
+            keys: HashMap::new(),
+        };
+
+        for index in 0..lookup.images.len() {
+            let filename = lookup.images[index]
+                .as_ref()
+                .map(|image| image.filename.clone())
+                .unwrap_or_default();
+            for key in image_lookup_keys(&filename) {
+                lookup.keys.entry(key).or_default().push(index);
+            }
+        }
+
+        Ok(lookup)
+    }
+
+    fn take(&mut self, requested: &str) -> Result<ImagePayload> {
+        let requested = requested.trim();
+        for key in image_lookup_keys(requested) {
+            let Some(indices) = self.keys.get(&key) else {
+                continue;
+            };
+            if indices.len() > 1 {
+                anyhow::bail!(
+                    "manifest image reference {requested} is ambiguous; upload unique filenames or use exact paths"
+                );
+            }
+            let index = indices[0];
+            return self.images[index].take().ok_or_else(|| {
+                anyhow::anyhow!("manifest references image {requested} more than once")
+            });
+        }
+
+        anyhow::bail!("manifest references missing image {requested}")
+    }
+
+    fn into_remaining(self) -> impl Iterator<Item = ImagePayload> {
+        self.images.into_iter().flatten()
+    }
+}
+
+fn image_lookup_keys(filename: &str) -> Vec<String> {
+    let trimmed = filename.trim();
+    let basename = image_basename(trimmed);
+    let basename_lower = basename.to_ascii_lowercase();
+    let mut keys = vec![
+        format!("exact:{trimmed}"),
+        format!("basename:{basename}"),
+        format!("basename-lower:{basename_lower}"),
+    ];
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn image_basename(filename: &str) -> &str {
+    filename
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(filename)
+        .trim()
 }

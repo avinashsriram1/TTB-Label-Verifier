@@ -15,6 +15,9 @@ pub trait OcrEngine: Send + Sync {
     fn name(&self) -> &'static str;
     fn is_available(&self) -> bool;
     async fn read(&self, image: &ImagePayload) -> Result<OcrOutput>;
+    async fn read_enhanced_retry(&self, image: &ImagePayload) -> Result<OcrOutput> {
+        self.read(image).await
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -145,6 +148,96 @@ impl OcrEngine for TesseractCliEngine {
                     break;
                 }
             }
+        }
+
+        Ok(OcrOutput {
+            image_id: image.image_id.clone(),
+            filename: image.filename.clone(),
+            engine: self.name().to_string(),
+            raw_text: raw_parts.join(" "),
+            spans: all_spans,
+            passes,
+            warnings,
+            elapsed_ms: started.elapsed().as_millis(),
+        })
+    }
+
+    async fn read_enhanced_retry(&self, image: &ImagePayload) -> Result<OcrOutput> {
+        let started = Instant::now();
+        let budget_ms = image_time_budget_ms();
+        let mut warnings = Vec::new();
+        let mut all_spans = Vec::new();
+        let mut raw_parts = Vec::new();
+        let mut passes = Vec::new();
+        let primary_bytes = prepare_primary_bytes(&image.bytes)?;
+
+        for variant in retry_variants(
+            &primary_bytes.bytes,
+            &image.image_id,
+            ProcessingProfile::Enhanced,
+            None,
+            "",
+        ) {
+            let remaining = remaining_budget_ms(started, budget_ms);
+            if remaining <= 250 {
+                warnings.push(
+                    "Enhanced OCR retry skipped because the per-image budget was nearly exhausted."
+                        .to_string(),
+                );
+                break;
+            }
+
+            let variant = match variant {
+                Ok(variant) => variant,
+                Err(err) => {
+                    warnings.push(format!("Enhanced OCR preprocessing failed: {err}"));
+                    continue;
+                }
+            };
+
+            match run_tesseract_bytes(
+                &variant.bytes,
+                &variant.image_id,
+                self.name(),
+                variant.profile,
+                variant.rotation_degrees,
+                remaining,
+            )
+            .await
+            {
+                Ok(output) if !output.raw_text.trim().is_empty() => {
+                    passes.push(output.report.clone());
+                    raw_parts.push(output.raw_text);
+                    all_spans.extend(output.spans);
+                }
+                Ok(output) => passes.push(output.report.clone()),
+                Err(err) => {
+                    warnings.push(format!(
+                        "Enhanced OCR retry {} {}deg failed: {err}",
+                        variant.profile, variant.rotation_degrees
+                    ));
+                    passes.push(OcrPassReport {
+                        image_id: variant.image_id,
+                        profile: variant.profile.to_string(),
+                        rotation_degrees: variant.rotation_degrees,
+                        elapsed_ms: 0,
+                        span_count: 0,
+                        mean_confidence: None,
+                        warning_heading_detected: false,
+                        error: Some(err.to_string()),
+                    });
+                }
+            }
+
+            if passes.iter().any(|pass| pass.warning_heading_detected)
+                || started.elapsed().as_millis() >= budget_ms
+            {
+                break;
+            }
+        }
+
+        if passes.is_empty() {
+            return Err(anyhow!("no enhanced OCR retry variants could be run"));
         }
 
         Ok(OcrOutput {

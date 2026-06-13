@@ -6,13 +6,15 @@ use crate::matching::{
 use crate::models::{
     CheckStatus, ExpectedFields, FieldCheck, OcrOutput, OcrPassReport, ProcessingPath,
     ProductInput, SpanLabel, SpanLabelKind, StageTiming, TextSpan, Verdict, VerificationResult,
+    WarningCheck,
 };
 use crate::ocr::OcrEngine;
 use crate::warning::check_government_warning;
 use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio::time::timeout;
 
 pub async fn verify_product(engine: &dyn OcrEngine, product: ProductInput) -> VerificationResult {
     let started = Instant::now();
@@ -60,6 +62,175 @@ pub async fn verify_product(engine: &dyn OcrEngine, product: ProductInput) -> Ve
         );
     }
 
+    let mut evaluation = evaluate_outputs(
+        "initial",
+        &product.expected,
+        &outputs,
+        started,
+        budget_ms,
+        &mut notes,
+        &mut stage_timings,
+    );
+
+    let mut enhanced_retry_ran = false;
+    if matches!(evaluation.verdict, Verdict::Fail) && !evaluation.budget_exhausted {
+        notes.push("First-pass failure triggered one enhanced OCR retry.".to_string());
+        let mut enhanced_outputs = Vec::new();
+        for image in &product.images {
+            let remaining = budget_ms.saturating_sub(started.elapsed().as_millis());
+            if remaining <= 500 {
+                notes.push(format!(
+                    "Enhanced OCR retry skipped for {} because the per-image budget was nearly exhausted.",
+                    image.filename
+                ));
+                break;
+            }
+
+            let stage_started = Instant::now();
+            let enhanced = timeout(
+                Duration::from_millis(remaining as u64),
+                engine.read_enhanced_retry(image),
+            )
+            .await;
+            match enhanced {
+                Ok(Ok(output)) => {
+                    enhanced_retry_ran = true;
+                    enhanced_outputs.push(output);
+                }
+                Ok(Err(err)) => {
+                    enhanced_retry_ran = true;
+                    notes.push(format!(
+                        "Enhanced OCR retry failed for {} using {}: {}",
+                        image.filename,
+                        engine.name(),
+                        err
+                    ));
+                    enhanced_outputs.push(OcrOutput {
+                        image_id: image.image_id.clone(),
+                        filename: image.filename.clone(),
+                        engine: engine.name().to_string(),
+                        raw_text: String::new(),
+                        spans: Vec::new(),
+                        passes: vec![OcrPassReport {
+                            image_id: format!("{}-enhanced", image.image_id),
+                            profile: "enhanced_failed".to_string(),
+                            rotation_degrees: 0,
+                            elapsed_ms: 0,
+                            span_count: 0,
+                            mean_confidence: None,
+                            warning_heading_detected: false,
+                            error: Some(err.to_string()),
+                        }],
+                        warnings: vec![err.to_string()],
+                        elapsed_ms: 0,
+                    });
+                }
+                Err(_) => {
+                    enhanced_retry_ran = true;
+                    let message = format!("enhanced OCR retry timed out after {remaining} ms");
+                    notes.push(format!("{} for {}", message, image.filename));
+                    enhanced_outputs.push(OcrOutput {
+                        image_id: image.image_id.clone(),
+                        filename: image.filename.clone(),
+                        engine: engine.name().to_string(),
+                        raw_text: String::new(),
+                        spans: Vec::new(),
+                        passes: vec![OcrPassReport {
+                            image_id: format!("{}-enhanced", image.image_id),
+                            profile: "enhanced_timeout".to_string(),
+                            rotation_degrees: 0,
+                            elapsed_ms: remaining,
+                            span_count: 0,
+                            mean_confidence: None,
+                            warning_heading_detected: false,
+                            error: Some(message),
+                        }],
+                        warnings: vec!["Enhanced OCR retry timed out.".to_string()],
+                        elapsed_ms: remaining,
+                    });
+                }
+            }
+            record_stage(
+                &mut stage_timings,
+                format!("enhanced_ocr:{}", image.filename),
+                stage_started,
+            );
+        }
+
+        if !enhanced_outputs.is_empty() {
+            outputs.extend(enhanced_outputs);
+            evaluation = evaluate_outputs(
+                "enhanced",
+                &product.expected,
+                &outputs,
+                started,
+                budget_ms,
+                &mut notes,
+                &mut stage_timings,
+            );
+        }
+    }
+
+    if enhanced_retry_ran && !evaluation.budget_exhausted {
+        evaluation.processing_path = ProcessingPath::EnhancedRetry;
+        evaluation.escalation_reason =
+            Some("first_pass_failure_triggered_enhanced_retry".to_string());
+    }
+
+    if evaluation.budget_exhausted && matches!(evaluation.verdict, Verdict::Pass) {
+        evaluation.verdict = Verdict::Review;
+        notes.push(
+            "Verification exceeded the per-image budget and was routed to review.".to_string(),
+        );
+    }
+
+    record_stage(&mut stage_timings, "total", started);
+
+    VerificationResult {
+        product_id: product.product_id,
+        label: product.label,
+        verdict: evaluation.verdict,
+        fields: evaluation.fields,
+        government_warning: evaluation.government_warning,
+        raw_text: evaluation.raw_text,
+        spans: evaluation.spans,
+        span_labels: evaluation.span_labels,
+        ocr_passes: evaluation.ocr_passes,
+        processing_path: evaluation.processing_path,
+        stage_timings,
+        budget_ms,
+        budget_exhausted: evaluation.budget_exhausted,
+        escalation_reason: evaluation.escalation_reason,
+        engines: evaluation.engines,
+        image_count: product.images.len(),
+        latency_ms: started.elapsed().as_millis(),
+        notes,
+    }
+}
+
+struct OutputEvaluation {
+    raw_text: String,
+    spans: Vec<TextSpan>,
+    ocr_passes: Vec<OcrPassReport>,
+    engines: Vec<String>,
+    fields: BTreeMap<String, FieldCheck>,
+    government_warning: WarningCheck,
+    span_labels: Vec<SpanLabel>,
+    verdict: Verdict,
+    budget_exhausted: bool,
+    processing_path: ProcessingPath,
+    escalation_reason: Option<String>,
+}
+
+fn evaluate_outputs(
+    phase: &str,
+    expected: &ExpectedFields,
+    outputs: &[OcrOutput],
+    started: Instant,
+    budget_ms: u128,
+    notes: &mut Vec<String>,
+    stage_timings: &mut Vec<StageTiming>,
+) -> OutputEvaluation {
     let stage_started = Instant::now();
     let raw_text = outputs
         .iter()
@@ -80,60 +251,56 @@ pub async fn verify_product(engine: &dyn OcrEngine, product: ProductInput) -> Ve
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    record_stage(&mut stage_timings, "ocr_merge", stage_started);
+    record_stage(stage_timings, format!("{phase}:ocr_merge"), stage_started);
 
     let stage_started = Instant::now();
-    let fields = verify_fields(&product.expected, &raw_text, &spans);
-    record_stage(&mut stage_timings, "field_checks", stage_started);
+    let fields = verify_fields(expected, &raw_text, &spans);
+    record_stage(
+        stage_timings,
+        format!("{phase}:field_checks"),
+        stage_started,
+    );
 
     let stage_started = Instant::now();
     let government_warning = check_government_warning(&raw_text, &spans);
-    record_stage(&mut stage_timings, "government_warning", stage_started);
+    record_stage(
+        stage_timings,
+        format!("{phase}:government_warning"),
+        stage_started,
+    );
 
     let stage_started = Instant::now();
     let span_labels = if started.elapsed().as_millis() >= budget_ms {
         notes.push("Span labeling skipped because the per-image budget was exhausted.".to_string());
         Vec::new()
     } else {
-        label_spans(&product.expected, &spans)
+        label_spans(expected, &spans)
     };
-    record_stage(&mut stage_timings, "span_labeling", stage_started);
+    record_stage(
+        stage_timings,
+        format!("{phase}:span_labeling"),
+        stage_started,
+    );
 
-    let mut verdict = aggregate_verdict(&fields, &government_warning.status);
+    let verdict = aggregate_verdict(&fields, &government_warning.status);
     let budget_exhausted = started.elapsed().as_millis() >= budget_ms;
     let processing_path =
         processing_path(&government_warning.status, &ocr_passes, budget_exhausted);
     let escalation_reason =
         escalation_reason(&government_warning.status, &ocr_passes, budget_exhausted);
 
-    if budget_exhausted && matches!(verdict, Verdict::Pass) {
-        verdict = Verdict::Review;
-        notes.push(
-            "Verification exceeded the per-image budget and was routed to review.".to_string(),
-        );
-    }
-
-    record_stage(&mut stage_timings, "total", started);
-
-    VerificationResult {
-        product_id: product.product_id,
-        label: product.label,
-        verdict,
-        fields,
-        government_warning,
+    OutputEvaluation {
         raw_text,
         spans,
-        span_labels,
         ocr_passes,
-        processing_path,
-        stage_timings,
-        budget_ms,
-        budget_exhausted,
-        escalation_reason,
         engines,
-        image_count: product.images.len(),
-        latency_ms: started.elapsed().as_millis(),
-        notes,
+        fields,
+        government_warning,
+        span_labels,
+        verdict,
+        budget_exhausted,
+        processing_path,
+        escalation_reason,
     }
 }
 
@@ -1224,6 +1391,7 @@ mod tests {
     use crate::ocr::OcrEngine;
     use crate::warning::CANONICAL_WARNING;
     use anyhow::Result;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn field_matching_tolerates_minor_brand_noise() {
@@ -1529,6 +1697,63 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct EnhancedRetryEngine {
+        enhanced_calls: AtomicUsize,
+    }
+
+    impl EnhancedRetryEngine {
+        fn output(&self, image: &ImagePayload, raw_text: &str, profile: &str) -> OcrOutput {
+            OcrOutput {
+                image_id: image.image_id.clone(),
+                filename: image.filename.clone(),
+                engine: self.name().to_string(),
+                raw_text: raw_text.to_string(),
+                spans: Vec::new(),
+                passes: vec![OcrPassReport {
+                    image_id: image.image_id.clone(),
+                    profile: profile.to_string(),
+                    rotation_degrees: 0,
+                    elapsed_ms: 1,
+                    span_count: 8,
+                    mean_confidence: Some(90.0),
+                    warning_heading_detected: raw_text.contains("GOVERNMENT WARNING"),
+                    error: None,
+                }],
+                warnings: Vec::new(),
+                elapsed_ms: 1,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OcrEngine for EnhancedRetryEngine {
+        fn name(&self) -> &'static str {
+            "enhanced-retry-mock"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn read(&self, image: &ImagePayload) -> Result<OcrOutput> {
+            Ok(self.output(
+                image,
+                "Blue Heron Silver Tequila 40% Alc./Vol. (80 Proof) 750 mL",
+                "mock",
+            ))
+        }
+
+        async fn read_enhanced_retry(&self, image: &ImagePayload) -> Result<OcrOutput> {
+            self.enhanced_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.output(
+                image,
+                "Blue Heron Silver Tequila 40% Alc./Vol. (80 Proof) 750 mL GOVERNMENT WARNING: drinking can cause health problems",
+                "enhanced_mock",
+            ))
+        }
+    }
+
     #[tokio::test]
     async fn multi_image_product_merges_front_and_back_text() {
         let product = ProductInput {
@@ -1613,6 +1838,42 @@ CEDAR KNOLLS, NJ STILL WHITE WINE"#;
         assert_eq!(result.fields["country"].status, CheckStatus::Pass);
         assert_eq!(result.government_warning.status, CheckStatus::Pass);
         assert_eq!(result.verdict, Verdict::Pass);
+    }
+
+    #[tokio::test]
+    async fn first_pass_fail_runs_enhanced_retry_before_final_verdict() {
+        let engine = EnhancedRetryEngine {
+            enhanced_calls: AtomicUsize::new(0),
+        };
+        let product = ProductInput {
+            product_id: "blue-heron".to_string(),
+            label: Some("Blue Heron".to_string()),
+            expected: ExpectedFields {
+                brand_name: Some("Blue Heron".to_string()),
+                class_type: Some("Silver Tequila".to_string()),
+                alcohol_content: Some("80 Proof".to_string()),
+                net_contents: Some("750 mL".to_string()),
+                bottler: None,
+                country: None,
+            },
+            images: vec![ImagePayload {
+                image_id: "front".to_string(),
+                filename: "front.txt".to_string(),
+                content_type: Some("text/plain".to_string()),
+                bytes: Vec::new(),
+            }],
+        };
+
+        let result = verify_product(&engine, product).await;
+
+        assert_eq!(engine.enhanced_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.verdict, Verdict::Pass);
+        assert_eq!(result.processing_path, ProcessingPath::EnhancedRetry);
+        assert_eq!(
+            result.escalation_reason.as_deref(),
+            Some("first_pass_failure_triggered_enhanced_retry")
+        );
+        assert_eq!(result.government_warning.status, CheckStatus::Pass);
     }
 
     #[tokio::test]
