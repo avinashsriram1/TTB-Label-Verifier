@@ -1,0 +1,74 @@
+﻿{
+    "products":  [
+                     {
+                         "product_id":  "hard-side-warning-wine",
+                         "label":  "hard-side-warning-wine",
+                         "image":  "17_hard_side_warning_dark_wine.png",
+                         "brand_name":  "Night Orchard",
+                         "class_type":  "Red Wine",
+                         "alcohol_content":  "13.2% Alc./Vol.",
+                         "net_contents":  "750 mL",
+                         "bottler":  "Night Orchard Winery",
+                         "country":  "United States",
+                         "expected_verdict":  "pass_or_review",
+                         "expected_path":  "enhanced_retry_or_timeout_review",
+                         "notes":  "Dark wine label with warning only in a side strip; should trigger V2 rotation/side-panel handling"
+                     },
+                     {
+                         "product_id":  "hard-low-contrast-lager",
+                         "label":  "hard-low-contrast-lager",
+                         "image":  "18_hard_low_contrast_gold_lager.png",
+                         "brand_name":  "Sunfield",
+                         "class_type":  "Lager Beer",
+                         "alcohol_content":  "5.0% Alc./Vol.",
+                         "net_contents":  "12 FL OZ",
+                         "bottler":  "Sunfield Brewing Co.",
+                         "country":  "United States",
+                         "expected_verdict":  "pass_or_review",
+                         "expected_path":  "cheap_repair_or_enhanced_retry",
+                         "notes":  "Low-contrast yellow label with noisy background; should exercise confidence and preprocessing gates"
+                     },
+                     {
+                         "product_id":  "hard-glare-tequila",
+                         "label":  "hard-glare-tequila",
+                         "image":  "19_hard_glare_tequila.png",
+                         "brand_name":  "Canyon Azul",
+                         "class_type":  "Reposado Tequila",
+                         "alcohol_content":  "40% Alc./Vol. (80 Proof)",
+                         "net_contents":  "750 mL",
+                         "bottler":  "Canyon Azul Imports",
+                         "country":  "Mexico",
+                         "expected_verdict":  "pass_or_review",
+                         "expected_path":  "enhanced_retry_or_timeout_review",
+                         "notes":  "Simulated camera glare crosses central label text; should trigger adaptive enhancement or bounded review"
+                     },
+                     {
+                         "product_id":  "hard-small-warning-liqueur",
+                         "label":  "hard-small-warning-liqueur",
+                         "image":  "20_hard_curved_warning_small_liqueur.png",
+                         "brand_name":  "Velvet Ember",
+                         "class_type":  "Coffee Liqueur",
+                         "alcohol_content":  "30% Alc./Vol. (60 Proof)",
+                         "net_contents":  "375 mL",
+                         "bottler":  "Velvet Ember Spirits",
+                         "country":  "United States",
+                         "expected_verdict":  "pass_or_review",
+                         "expected_path":  "cheap_repair_or_timeout_review",
+                         "notes":  "Small warning text near barcode on decorative red label; should avoid raw OCR leakage and may require V2"
+                     },
+                     {
+                         "product_id":  "hard-perspective-bourbon",
+                         "label":  "hard-perspective-bourbon",
+                         "image":  "21_hard_perspective_style_bourbon.png",
+                         "brand_name":  "Ridge \u0026 Barrel",
+                         "class_type":  "Straight Bourbon Whiskey",
+                         "alcohol_content":  "45% Alc./Vol. (90 Proof)",
+                         "net_contents":  "750 mL",
+                         "bottler":  "Ridge \u0026 Barrel Distilling Co.",
+                         "country":  "United States",
+                         "expected_verdict":  "pass_or_review",
+                         "expected_path":  "enhanced_retry_or_timeout_review",
+                         "notes":  "Skewed/perspective-style label; should test V2 preprocessing without exceeding budget"
+                     }
+                 ]
+}
