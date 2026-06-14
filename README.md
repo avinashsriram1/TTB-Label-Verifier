@@ -280,6 +280,10 @@ Runtime flags:
   exhausts the budget, the result is routed to review rather than continuing.
 - `TTB_BATCH_PARALLELISM=2` controls how many products are processed in parallel.
   Keeping this bounded prevents batch jobs from saturating CPU with Tesseract.
+- `TTB_BATCH_JOB_TTL_SECONDS=3600` controls how long completed batch jobs stay in
+  memory before cleanup. Active jobs are not expired.
+- `OMP_THREAD_LIMIT=1` keeps each local OCR subprocess from oversubscribing CPU
+  while batch products are already running in parallel.
 - `TTB_MAX_IMAGE_LONG_EDGE=1800` resizes oversized uploads before OCR.
 - `TTB_SPAN_LABEL_MODE=off|candidate|full` controls span labeling. The default
   `candidate` mode labels useful spans only and avoids expensive full-transcript
@@ -292,7 +296,8 @@ Runtime flags:
 ## Assumptions
 
 - This is a prototype, not a system of record.
-- Uploaded files and batch results are kept only in process memory for the current run.
+- Uploaded files and batch results are kept only in process memory for the current run;
+  completed batch jobs are removed after the configured TTL.
 - Tesseract is the bundled OCR engine in the Docker image.
 - Future COLA integration should use the HTTP/OpenAPI contract first, then add gRPC,
   sidecar, or C ABI adapters only if needed.

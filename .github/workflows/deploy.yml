@@ -48,4 +48,6 @@ jobs:
               TTB_PROCESSING_PROFILE=adaptive \
               TTB_IMAGE_TIME_BUDGET_MS=4500 \
               TTB_BATCH_PARALLELISM=2 \
-              TTB_SPAN_LABEL_MODE=candidate
+              TTB_BATCH_JOB_TTL_SECONDS=3600 \
+              TTB_SPAN_LABEL_MODE=candidate \
+              OMP_THREAD_LIMIT=1

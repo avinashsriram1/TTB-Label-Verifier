@@ -393,11 +393,11 @@ fn retry_profiles(
             }
         }
         ProcessingProfile::Enhanced => &[
+            ("original", 90),
+            ("original", 270),
             ("contrast", 0),
             ("threshold", 0),
-            ("original", 90),
             ("original", 180),
-            ("original", 270),
         ],
     }
 }
@@ -660,6 +660,10 @@ mod tests {
         assert_eq!(
             retry_profiles(ProcessingProfile::Enhanced, None, "").len(),
             5
+        );
+        assert_eq!(
+            retry_profiles(ProcessingProfile::Enhanced, None, "")[0],
+            ("original", 90)
         );
     }
 }

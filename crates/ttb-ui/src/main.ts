@@ -64,6 +64,17 @@ type BatchJob = {
   total: number;
   completed: number;
   counts: { pass: number; review: number; fail: number };
+  telemetry?: {
+    parallelism: number;
+    total_latency_ms: number;
+    average_latency_ms?: number | null;
+    slowest_latency_ms?: number | null;
+    timeout_count: number;
+    fast_pass: number;
+    cheap_repair: number;
+    enhanced_retry: number;
+    timeout_review: number;
+  };
   results: VerificationResult[];
   errors: string[];
 };
@@ -331,6 +342,7 @@ function renderBatchJob(job: BatchJob) {
       <span class="status review">Review ${job.counts.review}</span>
       <span class="status fail">Fail ${job.counts.fail}</span>
     </div>
+    ${renderBatchTelemetry(job)}
     <div class="batch-tools">
       <label>
         <span>Visible results</span>
@@ -345,6 +357,21 @@ function renderBatchJob(job: BatchJob) {
     </div>
     <div class="result-list">${filteredResults.length ? filteredResults.map(renderBatchResult).join("") : `<div class="empty">No results match the current batch filter.</div>`}</div>
     ${job.errors.map((error) => `<p class="error">${escapeHtml(error)}</p>`).join("")}
+  `;
+}
+
+function renderBatchTelemetry(job: BatchJob) {
+  const telemetry = job.telemetry;
+  if (!telemetry) return "";
+  return `
+    <div class="batch-telemetry">
+      <span><strong>${job.completed}/${job.total}</strong> complete</span>
+      <span><strong>${telemetry.parallelism}</strong> workers</span>
+      <span><strong>${formatDuration(telemetry.average_latency_ms ?? 0)}</strong> avg</span>
+      <span><strong>${formatDuration(telemetry.slowest_latency_ms ?? 0)}</strong> slowest</span>
+      <span><strong>${telemetry.timeout_count}</strong> timed out</span>
+      <span><strong>${telemetry.enhanced_retry}</strong> enhanced</span>
+    </div>
   `;
 }
 

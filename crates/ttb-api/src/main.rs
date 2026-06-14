@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{RwLock, Semaphore};
+use tokio::task::JoinSet;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
@@ -24,6 +25,7 @@ use ttb_core::{
 use uuid::Uuid;
 
 const MAX_IMAGES_PER_PRODUCT: usize = 4;
+const DEFAULT_BATCH_JOB_TTL_SECONDS: u64 = 3600;
 
 #[derive(Clone)]
 struct AppState {
@@ -66,6 +68,19 @@ struct BatchCounts {
     fail: usize,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+struct BatchTelemetry {
+    parallelism: usize,
+    total_latency_ms: u128,
+    average_latency_ms: Option<u128>,
+    slowest_latency_ms: Option<u128>,
+    timeout_count: usize,
+    fast_pass: usize,
+    cheap_repair: usize,
+    enhanced_retry: usize,
+    timeout_review: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct BatchJob {
     job_id: Uuid,
@@ -73,6 +88,9 @@ struct BatchJob {
     total: usize,
     completed: usize,
     counts: BatchCounts,
+    created_unix_ms: u128,
+    completed_unix_ms: Option<u128>,
+    telemetry: BatchTelemetry,
     results: Vec<VerificationResult>,
     errors: Vec<String>,
 }
@@ -200,6 +218,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
             "ocr_retry_mode": processing_profile(),
             "image_time_budget_ms": image_time_budget_ms(),
             "batch_parallelism": batch_parallelism(),
+            "batch_job_ttl_seconds": batch_job_ttl_seconds(),
             "max_image_long_edge": max_image_long_edge(),
             "span_label_mode": span_label_mode(),
             "candidate_engines": [
@@ -307,6 +326,8 @@ async fn create_batch_job(
     State(state): State<Arc<AppState>>,
     multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    cleanup_expired_jobs(&state).await;
+
     let form = read_multipart(multipart).await?;
     if form.images.is_empty() {
         return Err(AppError(anyhow::anyhow!("upload at least one image")));
@@ -314,6 +335,7 @@ async fn create_batch_job(
 
     let products = build_batch_products(form)?;
     let job_id = Uuid::new_v4();
+    let parallelism = batch_parallelism();
     let job = BatchJob {
         job_id,
         status: JobStatus::Queued,
@@ -323,6 +345,12 @@ async fn create_batch_job(
             pass: 0,
             review: 0,
             fail: 0,
+        },
+        created_unix_ms: unix_ms(),
+        completed_unix_ms: None,
+        telemetry: BatchTelemetry {
+            parallelism,
+            ..BatchTelemetry::default()
         },
         results: Vec::new(),
         errors: Vec::new(),
@@ -341,6 +369,8 @@ async fn get_batch_job(
     State(state): State<Arc<AppState>>,
     Path(job_id): Path<Uuid>,
 ) -> Result<Json<BatchJob>, AppError> {
+    cleanup_expired_jobs(&state).await;
+
     let jobs = state.jobs.read().await;
     let job = jobs
         .get(&job_id)
@@ -353,6 +383,8 @@ async fn export_batch_job(
     State(state): State<Arc<AppState>>,
     Path(job_id): Path<Uuid>,
 ) -> Result<Response, AppError> {
+    cleanup_expired_jobs(&state).await;
+
     let jobs = state.jobs.read().await;
     let job = jobs
         .get(&job_id)
@@ -503,32 +535,23 @@ async fn process_batch_job(state: Arc<AppState>, job_id: Uuid, products: Vec<Pro
     }
 
     let semaphore = Arc::new(Semaphore::new(batch_parallelism()));
-    let mut handles = Vec::with_capacity(products.len());
+    let mut tasks = JoinSet::new();
 
     for product in products {
         let ocr = state.ocr.clone();
         let semaphore = semaphore.clone();
-        handles.push(tokio::spawn(async move {
+        tasks.spawn(async move {
             let _permit = semaphore.acquire_owned().await.expect("semaphore open");
             verify_product(ocr.as_ref(), product).await
-        }));
+        });
     }
 
-    for handle in handles {
-        match handle.await {
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
             Ok(result) => {
                 let result = apply_batch_verdict_policy(result);
                 let result = sanitize_result_for_response(result, &state.config);
-                let mut jobs = state.jobs.write().await;
-                if let Some(job) = jobs.get_mut(&job_id) {
-                    job.completed += 1;
-                    match result.verdict {
-                        Verdict::Pass => job.counts.pass += 1,
-                        Verdict::Review => job.counts.review += 1,
-                        Verdict::Fail => job.counts.fail += 1,
-                    }
-                    job.results.push(result);
-                }
+                record_batch_result(&state, job_id, result).await;
             }
             Err(err) => {
                 let mut jobs = state.jobs.write().await;
@@ -547,7 +570,42 @@ async fn process_batch_job(state: Arc<AppState>, job_id: Uuid, products: Vec<Pro
         } else {
             JobStatus::Failed
         };
+        job.completed_unix_ms = Some(unix_ms());
     }
+}
+
+async fn record_batch_result(state: &Arc<AppState>, job_id: Uuid, result: VerificationResult) {
+    let mut jobs = state.jobs.write().await;
+    let Some(job) = jobs.get_mut(&job_id) else {
+        return;
+    };
+
+    job.completed += 1;
+    match result.verdict {
+        Verdict::Pass => job.counts.pass += 1,
+        Verdict::Review => job.counts.review += 1,
+        Verdict::Fail => job.counts.fail += 1,
+    }
+
+    job.telemetry.total_latency_ms += result.latency_ms;
+    job.telemetry.average_latency_ms = Some(job.telemetry.total_latency_ms / job.completed as u128);
+    job.telemetry.slowest_latency_ms = Some(
+        job.telemetry
+            .slowest_latency_ms
+            .unwrap_or(0)
+            .max(result.latency_ms),
+    );
+    if result.budget_exhausted {
+        job.telemetry.timeout_count += 1;
+    }
+    match result.processing_path {
+        ttb_core::ProcessingPath::FastPass => job.telemetry.fast_pass += 1,
+        ttb_core::ProcessingPath::CheapRepair => job.telemetry.cheap_repair += 1,
+        ttb_core::ProcessingPath::EnhancedRetry => job.telemetry.enhanced_retry += 1,
+        ttb_core::ProcessingPath::TimeoutReview => job.telemetry.timeout_review += 1,
+    }
+
+    job.results.push(result);
 }
 
 fn apply_batch_verdict_policy(mut result: VerificationResult) -> VerificationResult {
@@ -694,6 +752,30 @@ fn batch_parallelism() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| (1..=8).contains(value))
         .unwrap_or(2)
+}
+
+fn batch_job_ttl_seconds() -> u64 {
+    std::env::var("TTB_BATCH_JOB_TTL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (60..=86_400).contains(value))
+        .unwrap_or(DEFAULT_BATCH_JOB_TTL_SECONDS)
+}
+
+fn unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+async fn cleanup_expired_jobs(state: &Arc<AppState>) {
+    let cutoff = unix_ms().saturating_sub(batch_job_ttl_seconds() as u128 * 1000);
+    let mut jobs = state.jobs.write().await;
+    jobs.retain(|_, job| match job.completed_unix_ms {
+        Some(completed_at) => completed_at >= cutoff,
+        None => true,
+    });
 }
 
 fn max_image_long_edge() -> u32 {
@@ -883,6 +965,87 @@ mod tests {
         let result = apply_batch_verdict_policy(result);
         assert_eq!(result.fields["bottler"].status, CheckStatus::Review);
         assert_eq!(result.verdict, Verdict::Fail);
+    }
+
+    fn test_state_with_job(job: BatchJob) -> Arc<AppState> {
+        let mut jobs = HashMap::new();
+        jobs.insert(job.job_id, job);
+        Arc::new(AppState {
+            ocr: Arc::new(TesseractCliEngine::new()),
+            jobs: Arc::new(RwLock::new(jobs)),
+            corrections: Arc::new(RwLock::new(Vec::new())),
+            config: AppConfig {
+                show_raw_ocr: false,
+                correction_store_path: None,
+            },
+        })
+    }
+
+    fn empty_job(job_id: Uuid) -> BatchJob {
+        BatchJob {
+            job_id,
+            status: JobStatus::Running,
+            total: 2,
+            completed: 0,
+            counts: BatchCounts {
+                pass: 0,
+                review: 0,
+                fail: 0,
+            },
+            created_unix_ms: unix_ms(),
+            completed_unix_ms: None,
+            telemetry: BatchTelemetry {
+                parallelism: 2,
+                ..BatchTelemetry::default()
+            },
+            results: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_result_updates_telemetry_as_products_finish() {
+        let job_id = Uuid::new_v4();
+        let state = test_state_with_job(empty_job(job_id));
+        let mut result = result_with_raw_ocr();
+        result.latency_ms = 4100;
+        result.processing_path = ProcessingPath::EnhancedRetry;
+
+        record_batch_result(&state, job_id, result).await;
+
+        let jobs = state.jobs.read().await;
+        let job = jobs.get(&job_id).unwrap();
+        assert_eq!(job.completed, 1);
+        assert_eq!(job.counts.pass, 1);
+        assert_eq!(job.telemetry.average_latency_ms, Some(4100));
+        assert_eq!(job.telemetry.slowest_latency_ms, Some(4100));
+        assert_eq!(job.telemetry.enhanced_retry, 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_expired_jobs_keeps_running_jobs() {
+        let job_id = Uuid::new_v4();
+        let mut job = empty_job(job_id);
+        job.created_unix_ms = 1;
+        job.completed_unix_ms = None;
+        let state = test_state_with_job(job);
+
+        cleanup_expired_jobs(&state).await;
+
+        assert!(state.jobs.read().await.contains_key(&job_id));
+    }
+
+    #[tokio::test]
+    async fn cleanup_expired_jobs_removes_completed_jobs() {
+        let job_id = Uuid::new_v4();
+        let mut job = empty_job(job_id);
+        job.status = JobStatus::Complete;
+        job.completed_unix_ms = Some(1);
+        let state = test_state_with_job(job);
+
+        cleanup_expired_jobs(&state).await;
+
+        assert!(!state.jobs.read().await.contains_key(&job_id));
     }
 
     #[test]

@@ -24,6 +24,6 @@ COPY --from=ui-build /ui/dist /app/public
 COPY samples /app/samples
 ENV TTB_UI_DIR=/app/public
 ENV PORT=8080
+ENV OMP_THREAD_LIMIT=1
 EXPOSE 8080
 CMD ["/app/ttb-api"]
-
