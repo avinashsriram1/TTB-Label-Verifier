@@ -183,6 +183,14 @@ Azure is used only for container hosting. OCR and verification run inside the
 container. The app does not depend on Azure ML, cloud OCR, hosted LLMs, or outbound
 model endpoints.
 
+### In-Built Developer Debug Mode
+
+Developer Debug Mode is available for troubleshooting OCR behavior, but it is locked
+behind safe defaults. The UI debug toggle only exposes raw OCR when the server is
+explicitly configured with `TTB_ALLOW_CLIENT_DEBUG=true` or `TTB_SHOW_RAW_OCR=true`.
+In the deployed agent workflow, OCR/debug details and raw OCR are inaccessible by
+default.
+
 Production-oriented runtime defaults:
 
 ```text
