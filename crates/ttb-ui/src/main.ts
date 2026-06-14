@@ -80,7 +80,7 @@ type BatchJob = {
 };
 
 type HealthResponse = {
-  security?: { raw_ocr_visible?: boolean };
+  security?: { raw_ocr_visible?: boolean; client_debug_allowed?: boolean };
   corrections?: { enabled?: boolean; durable?: boolean };
   v2?: {
     processing_profile?: string;
@@ -93,6 +93,7 @@ type HealthResponse = {
 type BatchResultFilter = "issues" | "all" | "review" | "fail";
 type HelpDialog = { title: string; body: string } | null;
 type ReviewDrafts = Record<string, Record<string, string>>;
+type SingleFormValues = Record<string, string>;
 
 const appElement = document.querySelector<HTMLDivElement>("#app");
 if (!appElement) throw new Error("missing app root");
@@ -110,8 +111,21 @@ let reviewReasonFilter: "all" | "warning" | "class_type" | "country" | "low_conf
 let correctionMessage = "";
 let helpDialog: HelpDialog = null;
 let reviewDrafts: ReviewDrafts = {};
+let debugMode = false;
+let singleSelectedImages: File[] = [];
+let batchSelectedImages: File[] = [];
+let batchManifestFile: File | null = null;
+let singleFormValues: SingleFormValues = {
+  brand_name: "",
+  class_type: "",
+  alcohol_content: "",
+  net_contents: "",
+  bottler: "",
+  country: "",
+};
 let serverConfig = {
   rawOcrVisible: false,
+  clientDebugAllowed: false,
   correctionsEnabled: true,
   correctionsDurable: false,
   processingProfile: "adaptive",
@@ -128,11 +142,14 @@ function render() {
         <h1>TTB Label Verifier</h1>
         <p>Offline label checks with V2 OCR telemetry, structured corrections, and raw OCR hidden by default.</p>
       </div>
-      <nav class="tabs" aria-label="Views">
-        ${tabButton("single", "Single")}
-        ${tabButton("batch", "Batch")}
-        ${tabButton("review", "Review")}
-      </nav>
+      <div class="topbar-actions">
+        ${debugToggle()}
+        <nav class="tabs" aria-label="Views">
+          ${tabButton("single", "Single")}
+          ${tabButton("batch", "Batch")}
+          ${tabButton("review", "Review")}
+        </nav>
+      </div>
     </header>
     <main>
       ${activeTab === "single" ? renderSingle() : ""}
@@ -143,6 +160,7 @@ function render() {
   `;
 
   bindTabs();
+  bindDebugToggle();
   if (activeTab === "single") bindSingle();
   if (activeTab === "batch") bindBatch();
   if (activeTab === "review") bindReview();
@@ -153,12 +171,30 @@ function tabButton(tab: typeof activeTab, label: string) {
   return `<button class="tab ${activeTab === tab ? "active" : ""}" data-tab="${tab}">${label}</button>`;
 }
 
+function debugToggle() {
+  const state = debugMode ? "on" : "off";
+  const access = serverConfig.rawOcrVisible || serverConfig.clientDebugAllowed ? "raw OCR allowed" : "raw OCR gated";
+  return `
+    <button class="debug-toggle ${debugMode ? "active" : ""}" type="button" data-debug-toggle="true" aria-pressed="${debugMode}">
+      Dev Debug: ${state}
+      <small>${access}</small>
+    </button>
+  `;
+}
+
 function bindTabs() {
   document.querySelectorAll<HTMLButtonElement>("[data-tab]").forEach((button) => {
     button.addEventListener("click", () => {
       activeTab = button.dataset.tab as typeof activeTab;
       render();
     });
+  });
+}
+
+function bindDebugToggle() {
+  document.querySelector<HTMLButtonElement>("[data-debug-toggle]")?.addEventListener("click", () => {
+    debugMode = !debugMode;
+    render();
   });
 }
 
@@ -216,16 +252,13 @@ function renderSingle() {
           <span>The image only needs to show the all-caps GOVERNMENT WARNING heading.</span>
         </div>
         ${singleFormMessage ? `<p class="form-error">${escapeHtml(singleFormMessage)}</p>` : ""}
-        ${field("brand_name", "Brand name", "Lenz Moser", "The exact brand from the application, such as Lenz Moser. Case does not matter.", true)}
-        ${field("class_type", "Class / type", "Dry White Wine", "Use a practical class/type like Dry White Wine, Beer, Bourbon Whiskey, Vodka, or Cider.", true)}
-        ${field("alcohol_content", "Alcohol content", "12%", "Enter the application ABV, such as 12%, 45% Alc./Vol., or 90 Proof if that is what you have.", true)}
-        ${field("net_contents", "Net contents", "1.0L", "Enter the package size, such as 750 mL, 1.0L, 12 fl oz, or 75 cl.", true)}
-        ${field("bottler", "Bottler / producer", "optional", "Optional producer or bottler text from the application. Leave blank if it is not part of this check.")}
-        ${field("country", "Country of origin", "Austria", "Use this for imported products, such as Austria, Mexico, France, or Product of Austria.")}
-        <label class="drop">
-          <span>Label images ${help("Label images", "Upload one to four images for the same product. Use multiple images when the front and back labels carry different required text.")}</span>
-          <input name="images" type="file" accept="image/*,.tif,.tiff" multiple required />
-        </label>
+        ${field("brand_name", "Brand name", "Lenz Moser", "The exact brand from the application, such as Lenz Moser. Case does not matter.", true, singleFormValues.brand_name)}
+        ${field("class_type", "Class / type", "Wine", "Use a practical class/type like Wine, Beer, Bourbon Whiskey, Vodka, or Cider.", true, singleFormValues.class_type)}
+        ${field("alcohol_content", "Alcohol content", "12%", "Enter the application ABV, such as 12%, 45% Alc./Vol., or 90 Proof if that is what you have.", true, singleFormValues.alcohol_content)}
+        ${field("net_contents", "Net contents", "1.0L", "Enter the package size, such as 750 mL, 1.0L, 12 fl oz, or 75 cl.", true, singleFormValues.net_contents)}
+        ${field("bottler", "Bottler / producer", "optional", "Optional producer or bottler text from the application. Leave blank if it is not part of this check.", false, singleFormValues.bottler)}
+        ${field("country", "Country of origin", "Austria", "Use this for imported products, such as Austria, Mexico, France, or Product of Austria.", false, singleFormValues.country)}
+        ${renderImagePicker("single", singleSelectedImages, "Label images", "Upload one to four images for the same product. Use multiple images when the front and back labels carry different required text.")}
         <button class="primary" type="submit">Verify</button>
       </form>
       <section class="panel result-panel">
@@ -252,17 +285,8 @@ function renderBatch() {
           <span>Each result shows its own processing time for debugging.</span>
         </div>
         ${batchFormMessage ? `<p class="form-error">${escapeHtml(batchFormMessage)}</p>` : ""}
-        <label class="drop">
-          <span>Label images ${help("Batch label images", "Upload all label images for the batch. A JSON manifest can group front and back images under one product.")}</span>
-          <input name="images" type="file" accept="image/*,.tif,.tiff" multiple required />
-        </label>
-        <label class="drop">
-          <span>
-            Manifest
-            ${help("Batch manifest", "Optional CSV or JSON file with expected application values. Without it, each image becomes a separate review item. JSON may be a top-level array or an object with a products array. Image references can use image, images, image_names, front_image, or back_image. Extra expected_verdict, expected_path, and notes fields are ignored by the verifier.")}
-          </span>
-          <input name="manifest" type="file" accept=".csv,.json" />
-        </label>
+        ${renderImagePicker("batch", batchSelectedImages, "Label images", "Upload all label images for the batch. A JSON manifest can group front and back images under one product.")}
+        ${renderManifestPicker()}
         <button class="primary" type="submit">Start Batch</button>
       </form>
       <section class="panel">
@@ -315,11 +339,18 @@ function renderReview() {
   `;
 }
 
-function field(name: string, label: string, placeholder: string, helpText: string, required = false) {
+function field(
+  name: string,
+  label: string,
+  placeholder: string,
+  helpText: string,
+  required = false,
+  value = "",
+) {
   return `
     <label>
       <span>${label} ${help(label, helpText)}</span>
-      <input name="${name}" placeholder="${placeholder}" ${required ? "required aria-required=\"true\"" : ""} autocomplete="off" />
+      <input name="${name}" placeholder="${placeholder}" value="${escapeHtml(value)}" ${required ? "required aria-required=\"true\"" : ""} autocomplete="off" />
     </label>
   `;
 }
@@ -330,6 +361,82 @@ function help(title: string, text: string) {
 
 function option(value: string, label: string, selectedValue: string) {
   return `<option value="${value}" ${selectedValue === value ? "selected" : ""}>${label}</option>`;
+}
+
+function renderImagePicker(kind: "single" | "batch", files: File[], label: string, helpText: string) {
+  const summary = files.length
+    ? `${files.length} selected${kind === "single" ? " (max 4)" : ""}`
+    : kind === "single"
+      ? "No images selected"
+      : "No batch images selected";
+
+  return `
+    <div class="drop image-picker">
+      <div class="picker-head">
+        <span>${label} ${help(label, helpText)}</span>
+        <span class="chip">${summary}</span>
+      </div>
+      <label class="file-button">
+        <span>Add images</span>
+        <input data-image-picker="${kind}" name="images" type="file" accept="image/*,.tif,.tiff" multiple />
+      </label>
+      ${renderSelectedImages(kind, files)}
+    </div>
+  `;
+}
+
+function renderSelectedImages(kind: "single" | "batch", files: File[]) {
+  if (!files.length) {
+    return `<p class="empty compact-empty">Choose one or more label images. Reopen the picker to add more sides.</p>`;
+  }
+
+  return `
+    <div class="selected-files" aria-label="Selected ${kind} label images">
+      ${files
+        .map(
+          (file, index) => `
+            <div class="selected-file">
+              <span>
+                <strong>${escapeHtml(file.name)}</strong>
+                <small>${formatFileSize(file.size)}</small>
+              </span>
+              <button class="secondary small" type="button" data-file-action="remove" data-file-kind="${kind}" data-file-index="${index}">Remove</button>
+            </div>
+          `,
+        )
+        .join("")}
+      <button class="secondary compact" type="button" data-file-action="clear" data-file-kind="${kind}">Clear all</button>
+    </div>
+  `;
+}
+
+function renderManifestPicker() {
+  return `
+    <div class="drop image-picker">
+      <div class="picker-head">
+        <span>
+          Manifest
+          ${help("Batch manifest", "Optional CSV or JSON file with expected application values. Without it, each image becomes a separate review item. JSON may be a top-level array or an object with a products array. Image references can use image, images, image_names, front_image, or back_image. Extra expected_verdict, expected_path, and notes fields are ignored by the verifier.")}
+        </span>
+        <span class="chip">${batchManifestFile ? "1 selected" : "optional"}</span>
+      </div>
+      <label class="file-button">
+        <span>Add manifest</span>
+        <input data-manifest-picker="true" name="manifest" type="file" accept=".csv,.json" />
+      </label>
+      ${
+        batchManifestFile
+          ? `<div class="selected-file">
+              <span>
+                <strong>${escapeHtml(batchManifestFile.name)}</strong>
+                <small>${formatFileSize(batchManifestFile.size)}</small>
+              </span>
+              <button class="secondary small" type="button" data-manifest-action="clear">Remove</button>
+            </div>`
+          : `<p class="empty compact-empty">Optional CSV or JSON manifest. The selected manifest stays visible before submission.</p>`
+      }
+    </div>
+  `;
 }
 
 function renderBatchJob(job: BatchJob) {
@@ -454,27 +561,7 @@ function renderResultBody(result: VerificationResult, includeReviewActions: bool
         <p>${escapeHtml(result.government_warning.detail)}</p>
         ${result.government_warning.issues.map((issue) => `<p>${escapeHtml(issue)}</p>`).join("")}
       </div>
-      <details class="debug">
-        <summary>OCR/debug details</summary>
-        <div class="debug-grid">
-          <span>Processing time</span><strong>${formatDuration(result.latency_ms)}</strong>
-          <span>Processing path</span><strong>${labelFor(result.processing_path || "fast_pass")}</strong>
-          <span>Budget</span><strong>${formatDuration(result.budget_ms || serverConfig.imageTimeBudgetMs)}</strong>
-          <span>Budget status</span><strong>${result.budget_exhausted ? "exhausted" : "within budget"}</strong>
-          ${result.escalation_reason ? `<span>Escalation</span><strong>${escapeHtml(result.escalation_reason)}</strong>` : ""}
-          <span>OCR engine</span><strong>${escapeHtml(result.engines?.join(", ") || "unknown")}</strong>
-          <span>Images processed</span><strong>${result.image_count}</strong>
-          <span>OCR passes</span><strong>${result.ocr_passes?.length ?? 0}</strong>
-          <span>Span labels</span><strong>${summarizeSpanLabels(result.span_labels ?? [])}</strong>
-        </div>
-        ${renderStageTimings(result.stage_timings ?? [])}
-        ${renderOcrPasses(result.ocr_passes ?? [])}
-        ${
-          serverConfig.rawOcrVisible
-            ? `<pre>${escapeHtml(result.raw_text || "No OCR text returned.")}</pre>`
-            : `<p class="redacted">Raw OCR text is hidden by deployment configuration. Set TTB_SHOW_RAW_OCR=true only for local debugging.</p>`
-        }
-      </details>
+      ${renderDebugDetails(result)}
       ${includeReviewActions ? renderReviewEditor(result) : ""}
       ${result.notes.map((note) => `<p class="note">${escapeHtml(note)}</p>`).join("")}
   `;
@@ -525,6 +612,40 @@ function renderStageTimings(timings: { stage: string; elapsed_ms: number }[]) {
       </tbody>
     </table>
   `;
+}
+
+function renderDebugDetails(result: VerificationResult) {
+  if (!debugMode) return "";
+  return `
+    <details class="debug" open>
+      <summary>OCR/debug details</summary>
+      <div class="debug-grid">
+        <span>Processing time</span><strong>${formatDuration(result.latency_ms)}</strong>
+        <span>Processing path</span><strong>${labelFor(result.processing_path || "fast_pass")}</strong>
+        <span>Budget</span><strong>${formatDuration(result.budget_ms || serverConfig.imageTimeBudgetMs)}</strong>
+        <span>Budget status</span><strong>${result.budget_exhausted ? "exhausted" : "within budget"}</strong>
+        ${result.escalation_reason ? `<span>Escalation</span><strong>${escapeHtml(result.escalation_reason)}</strong>` : ""}
+        <span>OCR engine</span><strong>${escapeHtml(result.engines?.join(", ") || "unknown")}</strong>
+        <span>Images processed</span><strong>${result.image_count}</strong>
+        <span>OCR passes</span><strong>${result.ocr_passes?.length ?? 0}</strong>
+        <span>Span labels</span><strong>${summarizeSpanLabels(result.span_labels ?? [])}</strong>
+      </div>
+      ${renderStageTimings(result.stage_timings ?? [])}
+      ${renderOcrPasses(result.ocr_passes ?? [])}
+      ${renderRawOcr(result)}
+    </details>
+  `;
+}
+
+function renderRawOcr(result: VerificationResult) {
+  if (result.raw_text) {
+    return `<pre>${escapeHtml(result.raw_text)}</pre>`;
+  }
+  const reason =
+    serverConfig.rawOcrVisible || serverConfig.clientDebugAllowed
+      ? "This result was already sanitized. Run the verification again with Dev Debug enabled."
+      : "Raw OCR is disabled by server configuration.";
+  return `<p class="redacted">${reason}</p>`;
 }
 
 function summarizeSpanLabels(labels: SpanLabel[]) {
@@ -613,7 +734,15 @@ function formatDuration(ms: number) {
   return ms >= 1000 ? `${(ms / 1000).toFixed(2)} sec` : `${ms} ms`;
 }
 
+function formatFileSize(bytes: number) {
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${bytes} B`;
+}
+
 function bindSingle() {
+  bindImageQueue("single");
+  bindSingleFormValues();
   document.querySelector<HTMLFormElement>("#single-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget as HTMLFormElement;
@@ -625,8 +754,10 @@ function bindSingle() {
     }
     singleFormMessage = "";
     const data = new FormData(form);
-    normalizeImageField(data);
+    appendQueuedImages(data, singleSelectedImages);
     singleResult = await postJson<VerificationResult>("/api/verify", data);
+    clearSelectedImages("single");
+    clearSingleFormValues();
     mergeReviewResults([singleResult]);
     render();
   });
@@ -648,20 +779,30 @@ function validateSingleForm(form: HTMLFormElement) {
     }
   }
 
-  const files = data.getAll("images").filter((file) => file instanceof File && file.size > 0);
-  if (!files.length) return "Upload at least one label image before running verification.";
+  if (!singleSelectedImages.length) return "Upload at least one label image before running verification.";
+  if (singleSelectedImages.length > 4) return "Upload at most four images for one product.";
   return "";
 }
 
 function bindBatch() {
+  bindImageQueue("batch");
+  bindManifestPicker();
   document.querySelector<HTMLFormElement>("#batch-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget as HTMLFormElement;
     const data = new FormData(form);
-    normalizeImageField(data);
+    appendQueuedImages(data, batchSelectedImages);
+    appendBatchManifest(data);
     batchFormMessage = "";
+    if (!batchSelectedImages.length) {
+      batchFormMessage = "Upload at least one batch image before starting the job.";
+      render();
+      return;
+    }
     try {
       const response = await postJson<{ job_id: string }>("/api/batch/jobs", data);
+      clearSelectedImages("batch");
+      batchManifestFile = null;
       await pollJob(response.job_id);
     } catch (error) {
       batchFormMessage = `Batch upload failed: ${errorMessage(error)}`;
@@ -825,12 +966,123 @@ function aggregateUiVerdict(result: VerificationResult): Verdict {
   return "pass";
 }
 
-function normalizeImageField(data: FormData) {
-  const files = data.getAll("images");
-  data.delete("images");
-  files.forEach((file) => {
-    if (file instanceof File && file.size > 0) data.append("images[]", file);
+function bindImageQueue(kind: "single" | "batch") {
+  document.querySelector<HTMLInputElement>(`input[data-image-picker="${kind}"]`)?.addEventListener("change", (event) => {
+    const input = event.currentTarget as HTMLInputElement;
+    const files = Array.from(input.files ?? []);
+    input.value = "";
+    if (!files.length) return;
+
+    const error = addSelectedImages(kind, files);
+    if (kind === "single") {
+      singleFormMessage = error || "";
+    } else {
+      batchFormMessage = error || "";
+    }
+    render();
   });
+
+  document.querySelectorAll<HTMLButtonElement>(`[data-file-kind="${kind}"]`).forEach((button) => {
+    button.addEventListener("click", () => {
+      const action = button.dataset.fileAction;
+      if (action === "remove") {
+        const index = Number(button.dataset.fileIndex);
+        removeSelectedImage(kind, index);
+      } else if (action === "clear") {
+        clearSelectedImages(kind);
+      }
+      render();
+    });
+  });
+}
+
+function bindSingleFormValues() {
+  document.querySelectorAll<HTMLInputElement>("#single-form input[name]").forEach((input) => {
+    if (!(input.name in singleFormValues)) return;
+    input.addEventListener("input", () => {
+      singleFormValues[input.name] = input.value;
+    });
+  });
+}
+
+function bindManifestPicker() {
+  document.querySelector<HTMLInputElement>("[data-manifest-picker]")?.addEventListener("change", (event) => {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0] ?? null;
+    input.value = "";
+    if (!file) return;
+    batchManifestFile = file;
+    batchFormMessage = "";
+    render();
+  });
+
+  document.querySelector<HTMLButtonElement>("[data-manifest-action=\"clear\"]")?.addEventListener("click", () => {
+    batchManifestFile = null;
+    batchFormMessage = "";
+    render();
+  });
+}
+
+function addSelectedImages(kind: "single" | "batch", files: File[]) {
+  const selected = kind === "single" ? singleSelectedImages : batchSelectedImages;
+  const unique = files.filter((file) => !selected.some((existing) => sameFile(existing, file)));
+  if (kind === "single" && selected.length + unique.length > 4) {
+    return "Single product verification supports at most four images. Remove an image before adding more.";
+  }
+  if (kind === "single") {
+    singleSelectedImages = [...singleSelectedImages, ...unique];
+  } else {
+    batchSelectedImages = [...batchSelectedImages, ...unique];
+  }
+  return unique.length ? "" : "Those files are already selected.";
+}
+
+function removeSelectedImage(kind: "single" | "batch", index: number) {
+  if (kind === "single") {
+    singleSelectedImages = singleSelectedImages.filter((_, fileIndex) => fileIndex !== index);
+    singleFormMessage = "";
+  } else {
+    batchSelectedImages = batchSelectedImages.filter((_, fileIndex) => fileIndex !== index);
+    batchFormMessage = "";
+  }
+}
+
+function clearSelectedImages(kind: "single" | "batch") {
+  if (kind === "single") {
+    singleSelectedImages = [];
+    singleFormMessage = "";
+  } else {
+    batchSelectedImages = [];
+    batchFormMessage = "";
+  }
+}
+
+function clearSingleFormValues() {
+  singleFormValues = {
+    brand_name: "",
+    class_type: "",
+    alcohol_content: "",
+    net_contents: "",
+    bottler: "",
+    country: "",
+  };
+}
+
+function sameFile(a: File, b: File) {
+  return a.name === b.name && a.size === b.size && a.lastModified === b.lastModified;
+}
+
+function appendQueuedImages(data: FormData, files: File[]) {
+  data.delete("images");
+  data.delete("images[]");
+  if (debugMode) data.set("debug_mode", "true");
+  else data.delete("debug_mode");
+  files.forEach((file) => data.append("images[]", file));
+}
+
+function appendBatchManifest(data: FormData) {
+  data.delete("manifest");
+  if (batchManifestFile) data.append("manifest", batchManifestFile);
 }
 
 async function pollJob(jobId: string) {
@@ -926,6 +1178,7 @@ async function loadServerConfig() {
   const health = await getJson<HealthResponse>("/api/health");
   serverConfig = {
     rawOcrVisible: Boolean(health.security?.raw_ocr_visible),
+    clientDebugAllowed: Boolean(health.security?.client_debug_allowed),
     correctionsEnabled: health.corrections?.enabled !== false,
     correctionsDurable: Boolean(health.corrections?.durable),
     processingProfile: health.v2?.processing_profile || "adaptive",

@@ -187,6 +187,7 @@ Production-oriented runtime defaults:
 
 ```text
 TTB_SHOW_RAW_OCR=false
+TTB_ALLOW_CLIENT_DEBUG=false
 TTB_PROCESSING_PROFILE=adaptive
 TTB_IMAGE_TIME_BUDGET_MS=4500
 TTB_BATCH_PARALLELISM=2
@@ -242,6 +243,7 @@ Docker:
 docker build -t ttb-label-verifier .
 docker run --rm -p 8080:8080 `
   -e TTB_SHOW_RAW_OCR=false `
+  -e TTB_ALLOW_CLIENT_DEBUG=false `
   -e TTB_PROCESSING_PROFILE=adaptive `
   -e TTB_IMAGE_TIME_BUDGET_MS=4500 `
   -e TTB_BATCH_PARALLELISM=2 `

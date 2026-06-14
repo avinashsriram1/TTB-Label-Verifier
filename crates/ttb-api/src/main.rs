@@ -38,6 +38,7 @@ struct AppState {
 #[derive(Debug, Clone)]
 struct AppConfig {
     show_raw_ocr: bool,
+    allow_client_debug: bool,
     correction_store_path: Option<PathBuf>,
 }
 
@@ -45,6 +46,7 @@ impl AppConfig {
     fn from_env() -> Self {
         Self {
             show_raw_ocr: env_flag("TTB_SHOW_RAW_OCR", false),
+            allow_client_debug: env_flag("TTB_ALLOW_CLIENT_DEBUG", false),
             correction_store_path: std::env::var("TTB_CORRECTIONS_PATH")
                 .ok()
                 .map(PathBuf::from),
@@ -205,7 +207,8 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
             "available": state.ocr.is_available()
         },
         "security": {
-            "raw_ocr_visible": state.config.show_raw_ocr
+            "raw_ocr_visible": state.config.show_raw_ocr,
+            "client_debug_allowed": state.config.allow_client_debug
         },
         "corrections": {
             "enabled": true,
@@ -299,6 +302,7 @@ async fn verify(
         .cloned()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let label = form.fields.get("label").cloned();
+    let debug_requested = request_debug_mode(&form.fields);
 
     if form.images.is_empty() {
         return Err(AppError(anyhow::anyhow!("upload at least one image")));
@@ -318,6 +322,7 @@ async fn verify(
     let result = sanitize_result_for_response(
         verify_product(state.ocr.as_ref(), product).await,
         &state.config,
+        debug_requested,
     );
     Ok(Json(result))
 }
@@ -329,6 +334,7 @@ async fn create_batch_job(
     cleanup_expired_jobs(&state).await;
 
     let form = read_multipart(multipart).await?;
+    let debug_requested = request_debug_mode(&form.fields);
     if form.images.is_empty() {
         return Err(AppError(anyhow::anyhow!("upload at least one image")));
     }
@@ -359,7 +365,7 @@ async fn create_batch_job(
     state.jobs.write().await.insert(job_id, job);
     let state_for_task = state.clone();
     tokio::spawn(async move {
-        process_batch_job(state_for_task, job_id, products).await;
+        process_batch_job(state_for_task, job_id, products, debug_requested).await;
     });
 
     Ok(Json(serde_json::json!({ "job_id": job_id })))
@@ -526,7 +532,12 @@ async fn export_corrections(State(state): State<Arc<AppState>>) -> Result<Respon
     Ok((headers, Body::from(body)).into_response())
 }
 
-async fn process_batch_job(state: Arc<AppState>, job_id: Uuid, products: Vec<ProductInput>) {
+async fn process_batch_job(
+    state: Arc<AppState>,
+    job_id: Uuid,
+    products: Vec<ProductInput>,
+    debug_requested: bool,
+) {
     {
         let mut jobs = state.jobs.write().await;
         if let Some(job) = jobs.get_mut(&job_id) {
@@ -550,7 +561,7 @@ async fn process_batch_job(state: Arc<AppState>, job_id: Uuid, products: Vec<Pro
         match joined {
             Ok(result) => {
                 let result = apply_batch_verdict_policy(result);
-                let result = sanitize_result_for_response(result, &state.config);
+                let result = sanitize_result_for_response(result, &state.config, debug_requested);
                 record_batch_result(&state, job_id, result).await;
             }
             Err(err) => {
@@ -689,8 +700,9 @@ async fn append_correction_record(path: &PathBuf, record: &CorrectionRecord) -> 
 fn sanitize_result_for_response(
     mut result: VerificationResult,
     config: &AppConfig,
+    debug_requested: bool,
 ) -> VerificationResult {
-    if config.show_raw_ocr {
+    if should_show_raw_ocr(config, debug_requested) {
         return result;
     }
 
@@ -711,6 +723,19 @@ fn sanitize_result_for_response(
         .notes
         .push("Raw OCR text is hidden by deployment configuration.".to_string());
     result
+}
+
+fn should_show_raw_ocr(config: &AppConfig, debug_requested: bool) -> bool {
+    config.show_raw_ocr || (config.allow_client_debug && debug_requested)
+}
+
+fn request_debug_mode(fields: &BTreeMap<String, String>) -> bool {
+    fields.get("debug_mode").is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn env_flag(name: &str, default: bool) -> bool {
@@ -873,9 +898,10 @@ mod tests {
     fn response_sanitizer_hides_raw_ocr_by_default() {
         let config = AppConfig {
             show_raw_ocr: false,
+            allow_client_debug: false,
             correction_store_path: None,
         };
-        let result = sanitize_result_for_response(result_with_raw_ocr(), &config);
+        let result = sanitize_result_for_response(result_with_raw_ocr(), &config, false);
 
         assert!(result.raw_text.is_empty());
         assert_eq!(result.spans[0].text, "");
@@ -885,12 +911,58 @@ mod tests {
     }
 
     #[test]
+    fn response_sanitizer_hides_raw_ocr_when_client_debug_not_allowed() {
+        let config = AppConfig {
+            show_raw_ocr: false,
+            allow_client_debug: false,
+            correction_store_path: None,
+        };
+        let result = sanitize_result_for_response(result_with_raw_ocr(), &config, true);
+
+        assert!(result.raw_text.is_empty());
+        assert_eq!(result.spans[0].text, "");
+        assert!(result.government_warning.found_text.is_none());
+    }
+
+    #[test]
+    fn response_sanitizer_keeps_raw_ocr_for_allowed_client_debug_request() {
+        let config = AppConfig {
+            show_raw_ocr: false,
+            allow_client_debug: true,
+            correction_store_path: None,
+        };
+        let result = sanitize_result_for_response(result_with_raw_ocr(), &config, true);
+
+        assert_eq!(result.raw_text, "FULL RAW OCR");
+        assert_eq!(result.spans[0].text, "RAW OCR TEXT");
+        assert_eq!(
+            result.government_warning.found_text.as_deref(),
+            Some("GOVERNMENT WARNING raw body")
+        );
+    }
+
+    #[test]
+    fn response_sanitizer_hides_raw_ocr_when_client_debug_not_requested() {
+        let config = AppConfig {
+            show_raw_ocr: false,
+            allow_client_debug: true,
+            correction_store_path: None,
+        };
+        let result = sanitize_result_for_response(result_with_raw_ocr(), &config, false);
+
+        assert!(result.raw_text.is_empty());
+        assert_eq!(result.spans[0].text, "");
+        assert!(result.government_warning.found_text.is_none());
+    }
+
+    #[test]
     fn response_sanitizer_can_keep_raw_ocr_for_local_debug() {
         let config = AppConfig {
             show_raw_ocr: true,
+            allow_client_debug: false,
             correction_store_path: None,
         };
-        let result = sanitize_result_for_response(result_with_raw_ocr(), &config);
+        let result = sanitize_result_for_response(result_with_raw_ocr(), &config, false);
 
         assert_eq!(result.raw_text, "FULL RAW OCR");
         assert_eq!(result.spans[0].text, "RAW OCR TEXT");
@@ -976,6 +1048,7 @@ mod tests {
             corrections: Arc::new(RwLock::new(Vec::new())),
             config: AppConfig {
                 show_raw_ocr: false,
+                allow_client_debug: false,
                 correction_store_path: None,
             },
         })

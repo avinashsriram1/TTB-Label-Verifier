@@ -45,6 +45,7 @@ jobs:
             --image ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
             --set-env-vars \
               TTB_SHOW_RAW_OCR=false \
+              TTB_ALLOW_CLIENT_DEBUG=false \
               TTB_PROCESSING_PROFILE=adaptive \
               TTB_IMAGE_TIME_BUDGET_MS=4500 \
               TTB_BATCH_PARALLELISM=2 \
