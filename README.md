@@ -1,303 +1,302 @@
-# Offline TTB Label Verifier
+# TTB Label Verifier
 
-Rust prototype for verifying alcohol label images against application data without
-calling cloud OCR or ML endpoints. The app is designed for the TTB take-home prompt:
-fast label review, simple UI, batch processing, multi-image products, and strict
-government-warning handling.
+AI-assisted, offline-first Rust app for alcohol label verification.
 
-## What V1 Ships
+This project was built for the TTB AI-powered alcohol label verification take-home.
+It verifies uploaded alcohol label images against application data, supports single
+and batch review workflows, and is deployed as a Dockerized Rust service on Azure
+Container Apps.
 
-- Single-product verification from 1-4 uploaded label images.
-- Batch jobs with optional CSV or JSON manifest.
-- Multi-image product grouping, so a front image can supply brand/ABV while a back
-  image supplies the mandatory warning.
-- Offline OCR through a pluggable Rust `OcrEngine` trait.
-- Local Tesseract TSV adapter for OCR text, confidence, and bounding boxes.
-- Strict native government-warning check. Agents do not type the full warning.
-- Fuzzy matching for brand/class fields, deterministic parsing for ABV/proof and
-  net contents.
-- Review queue for every `review` or `fail` result.
-- Docker deployment with Tesseract bundled into the image.
-- OpenAPI JSON route for future COLA/.NET integration.
+The product goal is a one-stop shop for TTB agents: upload application data and
+label images, compare them automatically, triage pass/review/fail results, correct
+application issues in the same workflow, and export the final review output without
+leaving the tool.
 
-## Why This Design
+## Project Links
 
-The prompt calls out three constraints that drive the architecture:
+- Live app: <https://ttb-label-verifier.greensea-d13af920.eastus2.azurecontainerapps.io/>
+- Repository: <https://github.com/avinashsriram1/TTB-Label-Verifier>
+- OpenAPI contract: <https://ttb-label-verifier.greensea-d13af920.eastus2.azurecontainerapps.io/api/openapi.json>
+- Health/config check: <https://ttb-label-verifier.greensea-d13af920.eastus2.azurecontainerapps.io/api/health>
 
-1. Results need to return in roughly 5 seconds, or agents will ignore the tool.
-2. TTB networks may block outbound ML endpoints.
-3. COLA is .NET, but this prototype should not create framework lock-in.
+## Summary
 
-The solution is a small Rust service with a framework-neutral core crate and an HTTP
-contract. The verification engine can later be called by COLA through HTTP, gRPC, a
-sidecar, or a C ABI wrapper without rewriting the matching logic.
+- Full Rust implementation: Axum API plus framework-neutral `ttb-core` verification engine.
+- Offline OCR at runtime: local Tesseract is bundled in the container; no cloud OCR,
+  LLM, Azure ML, or external inference endpoint is required.
+- Adaptive OCR: fast first pass for easy labels, bounded enhanced retries for hard
+  labels, and rotation retries for side-panel warning text.
+- Batch-first workflow: CSV/JSON manifests, multi-image products, in-memory batch
+  queue, review/fail triage, CSV export, and bounded parallel OCR.
+- Agent workflow support: labels can be checked, corrected, failed, dismissed, and
+  exported from the same browser experience.
+- CI/CD enabled: GitHub Actions builds the Docker image and deploys `main` to Azure
+  Container Apps.
+- AI-engineered workflow: Codex was used as an architecture and implementation
+  partner, while the deployed verifier remains deterministic, auditable, and local.
+
+## Problem at Hand v.s. Solution Implemented
+
+| Problem | Solution |
+|---|---|
+| Results need to be fast enough for agents to use | Per-image OCR budget, latency telemetry, fast-first OCR, bounded enhanced retries |
+| Network may block cloud ML endpoints | OCR and verification run inside the container with local Tesseract |
+| Agents vary in technical comfort | One-stop shop with clear Single, Batch, and Review tabs; help modals; visible pass/review/fail statuses |
+| Batch imports are a major pain point | CSV/JSON manifests, grouped images per product, bounded parallelism, result filtering, CSV export |
+| Future COLA/.NET integration should be possible | OpenAPI/HTTP API boundary and framework-neutral Rust core crate |
+| PII and retention require care | Raw OCR hidden by default; no durable image storage; in-memory batch jobs with TTL cleanup |
+
+## AI Engineering Approach
+
+Codex was used as an AI engineering partner throughout the project, not as a
+runtime dependency.
+
+Codex helped with:
+
+- Interpreting the take-home prompt and converting stakeholder notes into an
+  implementation plan.
+- Comparing architectural options, including cloud OCR, local OCR, Rust, and
+  future LiteRT/RapidOCR/ONNX paths.
+- Building the Rust workspace, Axum API, OCR abstraction, Docker deployment, and
+  GitHub Actions pipeline.
+- Iterating through edge cases: proof-to-ABV conversion, title-case warnings,
+  country inference from city/state text, side-panel warning text, OCR confidence,
+  and raw OCR leakage.
+- Generating compliant, noncompliant, image-rich, and hard-case labels for testing.
+- Reasoning through differences between local Docker behavior and Azure Container
+  Apps resource constraints.
+
+Important distinction: Codex accelerated the engineering process, but the deployed
+application does not call Codex, an LLM, cloud OCR, or external ML services at
+runtime. The verifier uses local OCR plus deterministic compliance rules.
 
 ## Architecture
 
-```text
-Browser UI
-  -> Axum API
-    -> ttb-core verification pipeline
-      -> OcrEngine trait
-        -> local Tesseract TSV adapter
-      -> multi-image OCR merge
-      -> strict Government Warning check
-      -> field matching and verdict scoring
+```mermaid
+flowchart TD
+    A["Agent Browser UI"] --> B["Rust Axum API"]
+    B --> C["ttb-core Verification Engine"]
+    C --> D["Adaptive OCR Policy"]
+    D --> E["Local Tesseract OCR"]
+    C --> F["Rules + Parsers"]
+    C --> G["Fuzzy/Taxonomy Matching"]
+    B --> H["Batch Queue + Review Workflow"]
+    B --> I["OpenAPI Contract for COLA/.NET"]
+    J["Codex-Assisted Engineering"] --> K["Plans, Tests, Edge Labels, Refactors"]
+    K --> C
+    L["GitHub Actions"] --> M["Docker + Azure Container Apps"]
 ```
 
 Workspace layout:
 
 ```text
 crates/ttb-core   Framework-neutral OCR, matching, warning, manifest, and verification logic
-crates/ttb-api    Axum API, batch job state, static UI hosting, CSV export
-crates/ttb-ui     Vite/TypeScript UI
-samples/          Example manifests and sample guidance
-Dockerfile        Offline deployment image with Tesseract installed
+crates/ttb-api    Axum API, batch jobs, static UI hosting, OpenAPI, CSV export
+crates/ttb-ui     Vite/TypeScript frontend
+samples/          Generated compliant, noncompliant, image-rich, and hard-case labels
+Dockerfile        Offline deployment image with Rust API, UI assets, and Tesseract
 ```
 
-## API
+## Why Rust?
 
-### `POST /api/verify`
+Rust was chosen because this problem is a good fit for a small, high-confidence
+verification service:
 
-Multipart fields:
+- Strong type boundaries for compliance data, OCR spans, field checks, and verdicts.
+- Predictable native performance for OCR-heavy workflows.
+- Memory safety without a garbage-collected runtime.
+- Small Docker deployment surface.
+- Clean separation between core verification logic and web hosting.
+- Easy future integration with COLA through HTTP/OpenAPI without sharing a frontend
+  framework or runtime with .NET.
 
-- `images[]`: 1-4 label image files
-- `brand_name`
-- `class_type`
-- `alcohol_content`
-- `net_contents`
-- optional `bottler`
-- optional `country`
-- optional `product_id`
+The result is not a UI-only prototype. The compliance logic lives in `ttb-core`,
+which can be reused behind different integration surfaces later.
 
-Returns a product-level verdict, per-field results, warning result, OCR spans, raw OCR,
-engine metadata, and latency.
+## What the App Verifies
 
-### `POST /api/batch/jobs`
+The app compares uploaded label artwork against application fields:
 
-Multipart fields:
+- Brand name
+- Class/type
+- Alcohol content, including proof equivalence such as `80 Proof == 40% ABV`
+- Net contents with unit normalization
+- Bottler/producer
+- Country of origin, including common aliases and US city/state inference
+- Government warning heading
 
-- `images[]`: label image files
-- optional `manifest`: CSV or JSON
+Government warning policy:
 
-CSV is one row per image. JSON can group multiple images under one product:
+- Missing warning: fail
+- `Government Warning` in title case: fail
+- `GOVERNMENT WARNING` in all caps: pass
 
-```json
-[
-  {
-    "product": "Old Tom Bourbon 750",
-    "images": ["old-tom-front.png", "old-tom-back.png"],
-    "brand_name": "Old Tom Distillery",
-    "class_type": "Kentucky Straight Bourbon Whiskey",
-    "alcohol_content": "45% Alc./Vol.",
-    "net_contents": "750 mL"
-  }
-]
+The current implementation intentionally does not require word-for-word warning
+body matching because OCR can distort small statutory text. The all-caps heading
+remains a hard compliance check, and raw OCR is available only behind explicit
+debug configuration.
+
+## Adaptive OCR and Verification
+
+The OCR pipeline is designed to avoid the 30-40 second failure mode described in
+the prompt:
+
+1. Run a fast primary OCR pass.
+2. Evaluate deterministic field checks and warning detection.
+3. If the first result fails, run a bounded enhanced retry while staying inside
+   the per-image budget.
+4. Try rotation-aware OCR for sideways warning panels.
+5. Return pass, review, or fail with timing and OCR pass telemetry.
+
+This gives easy labels a fast path while still giving hard labels a second chance.
+The system records processing path, OCR passes, confidence, latency, budget status,
+and enhanced-retry usage for debugging and evaluation.
+
+## Batch Workflow
+
+Batch review is a first-class workflow:
+
+- Upload many label images at once.
+- Optionally provide a CSV or JSON manifest with expected application fields.
+- Group 1-4 images into the same product, such as front and back labels.
+- Process products with bounded parallelism to avoid saturating OCR.
+- Prioritize review/fail results for agents.
+- Review, correct, dismiss, or manually fail problematic applications without
+  switching systems.
+- Export batch results to CSV.
+- Keep batch jobs in memory with TTL cleanup for prototype-friendly retention.
+
+This is intentionally single-replica for the prototype because batch state is
+in-memory. Horizontal scaling should be added only after moving batch state to a
+shared store.
+
+## CI/CD and Deployment
+
+GitHub Actions is enabled for continuous deployment from `main`:
+
+1. Checkout code.
+2. Build Docker image.
+3. Push image to Azure Container Registry.
+4. Update Azure Container Apps with the new image and runtime flags.
+
+Azure is used only for container hosting. OCR and verification run inside the
+container. The app does not depend on Azure ML, cloud OCR, hosted LLMs, or outbound
+model endpoints.
+
+Production-oriented runtime defaults:
+
+```text
+TTB_SHOW_RAW_OCR=false
+TTB_PROCESSING_PROFILE=adaptive
+TTB_IMAGE_TIME_BUDGET_MS=4500
+TTB_BATCH_PARALLELISM=2
+TTB_BATCH_JOB_TTL_SECONDS=3600
+TTB_SPAN_LABEL_MODE=candidate
+OMP_THREAD_LIMIT=1
 ```
 
-### Other Routes
+## API and COLA Integration
 
+Primary routes:
+
+- `POST /api/verify`
+- `POST /api/batch/jobs`
 - `GET /api/batch/jobs/{job_id}`
 - `GET /api/batch/jobs/{job_id}/export.csv`
+- `POST /api/corrections`
+- `GET /api/corrections/export.csv`
 - `GET /api/health`
 - `GET /api/openapi.json`
 
-## Government Warning Policy
-
-V1 always checks the warning. The UI does not ask agents to type the full statement.
-
-Hard fail:
-
-- no government warning found
-- heading is not `GOVERNMENT WARNING`
-
-Pass:
-
-- OCR finds the all-caps `GOVERNMENT WARNING` heading
-
-V1 intentionally does not require word-for-word body matching because OCR can distort
-long, small warning text even when the mandatory heading is visible. Full OCR text is
-kept only inside the explicit debug disclosure, and field-level observed values are
-sanitized so they do not expose raw OCR snippets.
-
-Bold is intentionally not an automatic pass condition because OCR cannot reliably prove
-font weight from arbitrary label photos.
+Future COLA integration can start with the OpenAPI contract. COLA does not need
+to embed Rust or the frontend. It can call this verifier as an internal HTTP
+service, sidecar, or future gRPC/C ABI adapter if required.
 
 ## Run Locally
 
-Install Rust, Node.js, and Tesseract.
+Install:
+
+- Rust
+- Node.js
+- Tesseract OCR
+
+Build the UI and run the API:
 
 ```powershell
 cd crates/ttb-ui
 npm install
 npm run build
 cd ../..
-cargo run -p ttb-api
-```
-
-Open <http://localhost:8080>.
-
-On this Windows machine the default MSVC Rust target could not link because Visual
-Studio Build Tools are not installed. The already-configured GNU toolchain works:
-
-```powershell
 cargo +stable-x86_64-pc-windows-gnu run -p ttb-api
 ```
 
-## Docker
+Open:
 
-```bash
-docker build -t ttb-label-verifier .
-docker run --rm -p 8080:8080 ttb-label-verifier
+```text
+http://localhost:8080
 ```
 
-The container includes the API, built UI, Tesseract, and sample manifests. It does not
-need outbound network access at runtime.
-
-## Tests
+Docker:
 
 ```powershell
-cargo test
+docker build -t ttb-label-verifier .
+docker run --rm -p 8080:8080 `
+  -e TTB_SHOW_RAW_OCR=false `
+  -e TTB_PROCESSING_PROFILE=adaptive `
+  -e TTB_IMAGE_TIME_BUDGET_MS=4500 `
+  -e TTB_BATCH_PARALLELISM=2 `
+  -e OMP_THREAD_LIMIT=1 `
+  ttb-label-verifier
 ```
 
-The test suite covers:
+## Testing and Evaluation
 
-- government warning present/missing/title-case behavior
-- fuzzy text matching
-- ABV/proof parsing
-- net contents normalization
-- country aliases and US city/state inference
-- sanitized observed values that do not leak raw OCR
+Validation commands:
+
+```powershell
+cargo +stable-x86_64-pc-windows-gnu test
+cargo fmt --all -- --check
+cd crates/ttb-ui
+npm run build
+```
+
+The test suite and sample corpus cover:
+
+- Missing warning failure
+- Title-case warning failure
+- All-caps warning pass
+- ABV/proof equivalence
+- Net contents normalization
+- Country aliases and US city/state inference
+- Sanitized observed values with no raw OCR leakage
 - CSV and JSON manifest parsing
-- Tesseract TSV parsing
+- Adaptive OCR retry ordering
+- Batch policy and telemetry behavior
 
-## V1 vs V2
+The `samples/` directory includes compliant, noncompliant, image-rich, and hard-case
+labels for repeatable testing.
 
-| Area | V1 | V2 |
-|---|---|---|
-| Runtime | Rust service plus local OCR | Same core with additional model runtimes |
-| Cloud APIs | None | Still offline-first; optional only if firewall-safe |
-| OCR | Tesseract TSV adapter behind `OcrEngine` | Add benchmarked OCR engines such as ONNX/Paddle/RapidOCR |
-| Field extraction | Deterministic parsers and fuzzy matching | Learned text-span labeling from human corrections |
-| LiteRT.js | Not included | Candidate for browser-side acceleration or span labeling |
-| LLM fallback | Not included | Local lightweight fallback for low-confidence cases |
-| Review queue | Shows review/fail results | Human corrections become training data |
-| Storage | Ephemeral job state | Optional durable correction and audit store |
-
-LiteRT/LiteRT.js is intentionally kept out of V1. It is promising for client-side WebGPU
-or WASM inference, but V1's priority is a reliable offline verifier with a stable API,
-not model-conversion and browser-driver risk.
-
-## V2 Implementation Roadmap
-
-V2 should build on the V1 edge-case testing rather than replace the V1 guardrails. The
-known test labels exposed four priorities:
-
-- Lenz Moser: class/type extraction must prefer clean taxonomy matches such as
-  `White Wine` over arbitrary OCR chunks.
-- Blue Heron: proof must normalize to ABV, missing warnings must still hard fail, and
-  US origin can be inferred from city/state text such as `San Diego, CA`.
-- Cascade Winery: sideways warning text needs stronger image preprocessing and OCR
-  retry logic.
-- Ecstasy: observed values must never expose raw OCR text, even when a fuzzy match
-  succeeds.
-
-This branch implements the first V2 increment:
-
-- OCR pass telemetry for preprocessing and rotation retries.
-- Local contrast and threshold preprocessing before selected OCR retries.
-- A heuristic span-labeling baseline for future learned extraction.
-- Adaptive fast-first processing with a default 4.5 second per-image budget.
-- Review queue filters by verdict and fail/review reason.
-- Structured correction capture with no raw image or raw OCR storage.
-- API-level redaction for raw OCR, span text, and warning found text.
-
-### Image Robustness
-
-- Add local preprocessing profiles before OCR: contrast normalization, grayscale,
-  thresholding, denoise, resize, border crop, and label-region detection.
-- Expand the current rotation retry into a bounded strategy that tries selected
-  preprocessing plus `0`, `90`, `180`, and `270` degree rotations only when OCR
-  confidence is low or the warning heading is missing.
-- Add perspective correction and region slicing for labels where warning text is
-  sideways, low resolution, or separated from the main panel.
-- Record per-pass timing, OCR confidence, warning detection, and chosen preprocessing
-  profile so the app can prove it remains under the 5 second per-image target.
-
-### OCR Engine Benchmarking
-
-- Keep the current `OcrEngine` trait as the integration boundary.
-- Add local-only candidate engines behind feature flags, including enhanced Tesseract
-  configs, RapidOCR/PaddleOCR through ONNX, and a Rust-native OCR path if quality is
-  acceptable.
-- Benchmark each engine against the V1 edge-case corpus for latency, warning detection,
-  extracted fields, and final verdict.
-- Choose the default engine from measured quality and speed, while keeping Tesseract as
-  the baseline fallback.
-
-### Learned Field Extraction
-
-- Add a span-labeling layer after OCR that classifies spans as `brand_name`,
-  `class_type`, `alcohol_content`, `net_contents`, `government_warning`, `bottler`,
-  `country`, or `other`.
-- Use OCR text, normalized box position, box size, line grouping, neighboring text,
-  confidence, and taxonomy hints as model features.
-- Start with a lightweight local model such as gradient boosting or a compact ONNX
-  classifier before considering larger neural models.
-- Keep deterministic ABV/proof parsing, net contents parsing, government-warning
-  heading checks, country inference, and sanitized observed values as non-negotiable
-  guardrails.
-
-### LiteRT and LiteRT.js
-
-- Evaluate LiteRT.js for small browser-side models such as image quality scoring,
-  warning-region detection, or span labeling.
-- Keep all inference local through WebGPU, WASM, or an offline server-side runtime.
-- Do not make LiteRT a required dependency until model conversion, browser coverage,
-  and performance are proven on the edge-case corpus.
-- Keep the Rust API as the source of truth for final verdicts so COLA/.NET clients can
-  continue integrating through the OpenAPI contract.
-
-### Review, Corrections, and Security
-
-- Add an optional durable correction store with explicit retention settings and no
-  raw-image storage by default.
-- Store human corrections as structured labels rather than full OCR dumps.
-- Use correction data to train and evaluate the span-labeling model.
-- Keep the V1 in-memory review queue available for no-retention deployments.
-- Add a deployment flag to hide raw OCR debug output entirely in production.
-- Expand batch review filters by fail reason, warning status, class mismatch, country
-  mismatch, and low confidence.
-
-Runtime flags:
-
-- `TTB_SHOW_RAW_OCR=true` exposes raw OCR in API/UI debug output for local debugging.
-  The default is `false`.
-- `TTB_PROCESSING_PROFILE=adaptive|fast|enhanced` controls the fast-first policy.
-  The default is `adaptive`. Use `fast` for a V1-style primary OCR pass only, and
-  `enhanced` only for manual hard-label experiments.
-- `TTB_IMAGE_TIME_BUDGET_MS=4500` caps the per-image work budget. If processing
-  exhausts the budget, the result is routed to review rather than continuing.
-- `TTB_BATCH_PARALLELISM=2` controls how many products are processed in parallel.
-  Keeping this bounded prevents batch jobs from saturating CPU with Tesseract.
-- `TTB_BATCH_JOB_TTL_SECONDS=3600` controls how long completed batch jobs stay in
-  memory before cleanup. Active jobs are not expired.
-- `OMP_THREAD_LIMIT=1` keeps each local OCR subprocess from oversubscribing CPU
-  while batch products are already running in parallel.
-- `TTB_MAX_IMAGE_LONG_EDGE=1800` resizes oversized uploads before OCR.
-- `TTB_SPAN_LABEL_MODE=off|candidate|full` controls span labeling. The default
-  `candidate` mode labels useful spans only and avoids expensive full-transcript
-  labeling.
-- `TTB_OCR_RETRY_MODE=fast|balanced|enhanced` is still accepted for compatibility,
-  but `TTB_PROCESSING_PROFILE` is preferred.
-- `TTB_CORRECTIONS_PATH=./tmp/corrections.ndjson` appends structured correction
-  records to newline-delimited JSON. If unset, corrections stay in memory only.
-
-## Assumptions
+## Assumptions and Tradeoffs
 
 - This is a prototype, not a system of record.
-- Uploaded files and batch results are kept only in process memory for the current run;
-  completed batch jobs are removed after the configured TTL.
-- Tesseract is the bundled OCR engine in the Docker image.
-- Future COLA integration should use the HTTP/OpenAPI contract first, then add gRPC,
-  sidecar, or C ABI adapters only if needed.
+- Uploaded images are not durably stored by default.
+- Batch jobs use in-memory state with TTL cleanup to keep retention simple.
+- Horizontal replica scaling should wait until batch state is externalized.
+- Warning body word-for-word matching is not enforced because OCR noise can distort
+  small warning text; the all-caps `GOVERNMENT WARNING` heading remains a hard check.
+- Future local-only AI improvements could include RapidOCR/ONNX benchmarking,
+  learned span labeling from corrections, and LiteRT.js for client-side image
+  quality or warning-region scoring.
+
+## What Goes Beyond the Minimum
+
+- Full Rust architecture rather than a thin scripting prototype.
+- Offline/firewall-safe OCR deployment.
+- Adaptive OCR with explainable telemetry.
+- Agent-centered one-stop workflow for matching applications to labels, correcting
+  issues, deciding final failures, and exporting results.
+- CI/CD to a public Azure Container Apps URL.
+- Generated test corpus for edge-case validation.
+- COLA-ready OpenAPI boundary.
+- AI-assisted engineering process using Codex while keeping runtime behavior
+  deterministic and auditable.
